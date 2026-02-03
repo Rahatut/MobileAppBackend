@@ -136,7 +136,7 @@ router.post('/', authMiddleware, async (req, res) => {
 });
 
 // Get all active rides (with optional filters)
-router.get('/', async (req, res) => {
+router.get('/', authMiddleware, async (req, res) => {
   try {
     const { transportMode, genderPreference, afterDate, beforeDate, page = 1, limit = 10 } = req.query;
     const offset = (page - 1) * limit;
@@ -151,8 +151,15 @@ router.get('/', async (req, res) => {
       LEFT JOIN Location_Info sl ON r.start_location_id = sl.location_id
       LEFT JOIN Location_Info dl ON r.dest_location_id = dl.location_id
       WHERE r.available_seats > 0
+      AND r.creator_id != $1
+      AND NOT EXISTS (
+        SELECT 1 FROM Join_Request jr 
+        WHERE jr.ride_id = r.ride_id 
+        AND jr.partner_id = $1
+        AND (SELECT status FROM Request_Status_Log WHERE request_id = jr.request_id ORDER BY timestamp DESC LIMIT 1) IN ('pending', 'accepted')
+      )
     `;
-    const params = [];
+    const params = [req.userId];
 
     // Filter by current status (active rides only)
     query += ` AND (SELECT status FROM Ride_Status_Log WHERE ride_id = r.ride_id ORDER BY timestamp DESC LIMIT 1) = 'unactive'`;
@@ -199,10 +206,12 @@ router.get('/driver/my-rides', authMiddleware, async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT r.*, 
+              u.name, u.username, u.user_uuid, u.avatar_url, u.avg_rating,
               sl.name as start_name, sl.address as start_address, sl.latitude as start_lat, sl.longitude as start_lng,
               dl.name as dest_name, dl.address as dest_address, dl.latitude as dest_lat, dl.longitude as dest_lng,
               (SELECT status FROM Ride_Status_Log WHERE ride_id = r.ride_id ORDER BY timestamp DESC LIMIT 1) as current_status
        FROM Ride r
+       JOIN "User" u ON r.creator_id = u.user_id
        LEFT JOIN Location_Info sl ON r.start_location_id = sl.location_id
        LEFT JOIN Location_Info dl ON r.dest_location_id = dl.location_id
        WHERE r.creator_id = $1 
@@ -214,6 +223,36 @@ router.get('/driver/my-rides', authMiddleware, async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Failed to fetch rides' });
+  }
+});
+
+// Get rides user has joined (as passenger)
+router.get('/passenger/my-rides', authMiddleware, async (req, res) => {
+  try {
+    console.log('🔵 Fetching joined rides for user:', req.userId);
+    const result = await pool.query(
+      `SELECT r.*, 
+              u.name, u.username, u.user_uuid, u.avatar_url, u.avg_rating,
+              sl.name as start_name, sl.address as start_address, sl.latitude as start_lat, sl.longitude as start_lng,
+              dl.name as dest_name, dl.address as dest_address, dl.latitude as dest_lat, dl.longitude as dest_lng,
+              (SELECT status FROM Ride_Status_Log WHERE ride_id = r.ride_id ORDER BY timestamp DESC LIMIT 1) as current_status,
+              (SELECT status FROM Request_Status_Log WHERE request_id = jr.request_id ORDER BY timestamp DESC LIMIT 1) as join_status
+       FROM Join_Request jr
+       JOIN Ride r ON jr.ride_id = r.ride_id
+       JOIN "User" u ON r.creator_id = u.user_id
+       LEFT JOIN Location_Info sl ON r.start_location_id = sl.location_id
+       LEFT JOIN Location_Info dl ON r.dest_location_id = dl.location_id
+       WHERE jr.partner_id = $1 
+       AND (SELECT status FROM Request_Status_Log WHERE request_id = jr.request_id ORDER BY timestamp DESC LIMIT 1) = 'accepted'
+       ORDER BY r.start_time DESC`,
+      [req.userId]
+    );
+    console.log('✅ Found', result.rows.length, 'joined rides');
+
+    res.json({ rides: result.rows });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch joined rides' });
   }
 });
 

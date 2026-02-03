@@ -35,8 +35,8 @@ async function getOrCreateLocation(client, name, latitude, longitude) {
   }
 
   const insertResult = await client.query(
-    'INSERT INTO Location_Info (name, latitude, longitude) VALUES ($1, $2, $3) RETURNING location_id',
-    [name, latitude, longitude]
+    'INSERT INTO Location_Info (name, address, latitude, longitude) VALUES ($1, $2, $3, $4) RETURNING location_id',
+    [name, name, latitude, longitude]
   );
 
   return insertResult.rows[0].location_id;
@@ -55,6 +55,27 @@ router.post('/', authMiddleware, async (req, res) => {
 
     await client.query('BEGIN');
 
+    // Check if user already has a join request for this ride
+    const existingRequest = await client.query(
+      `SELECT jr.request_id, 
+              (SELECT status FROM Request_Status_Log WHERE request_id = jr.request_id ORDER BY timestamp DESC LIMIT 1) as status
+       FROM Join_Request jr
+       WHERE jr.ride_id = $1 AND jr.partner_id = $2`,
+      [rideId, req.userId]
+    );
+
+    if (existingRequest.rows.length > 0) {
+      await client.query('ROLLBACK');
+      const status = existingRequest.rows[0].status;
+      if (status === 'accepted') {
+        return res.status(400).json({ error: 'You have already joined this ride' });
+      } else if (status === 'pending') {
+        return res.status(400).json({ error: 'You have already requested to join this ride' });
+      } else if (status === 'rejected') {
+        return res.status(400).json({ error: 'Your previous request was declined' });
+      }
+    }
+
     // Check ride exists and has available seats
     const rideResult = await client.query(
       'SELECT available_seats, fare, creator_id FROM Ride WHERE ride_id = $1',
@@ -69,6 +90,12 @@ router.post('/', authMiddleware, async (req, res) => {
     if (rideResult.rows[0].available_seats < 1) {
       await client.query('ROLLBACK');
       return res.status(400).json({ error: 'No seats available' });
+    }
+
+    // Prevent creator from joining their own ride
+    if (rideResult.rows[0].creator_id === req.userId) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'You cannot join your own ride' });
     }
 
     // Create locations if provided
@@ -107,19 +134,36 @@ router.post('/', authMiddleware, async (req, res) => {
     await addRequestStatus(client, joinRequest.request_id, 'pending');
 
     // Create notification for ride creator
-    const notificationQuery = `
-      INSERT INTO notifications (user_id, type, related_id, title, message)
-      VALUES ($1, $2, $3, $4, $5)
-    `;
-    // Note: You'll need to create a notifications table compatible with this schema
-    // For now, commenting this out as it's not in your schema
-    // await client.query(notificationQuery, [
-    //   rideResult.rows[0].creator_id,
-    //   'join_request',
-    //   joinRequest.request_id,
-    //   'New Join Request',
-    //   'Someone wants to join your ride',
-    // ]);
+    console.log('Creating notification for ride creator:', rideResult.rows[0].creator_id);
+    console.log('Join request ID:', joinRequest.request_id);
+    
+    const notificationResult = await client.query(
+      `INSERT INTO Notification (user_id, type, message, related_ride_id, related_request_id)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING *`,
+      [
+        rideResult.rows[0].creator_id,
+        'join_request',
+        'Someone wants to join your ride',
+        rideId,
+        joinRequest.request_id,
+      ]
+    );
+    
+    console.log('✅ Notification created:', notificationResult.rows[0]);
+
+    // Also create a confirmation notification for the requester
+    await client.query(
+      `INSERT INTO Notification (user_id, type, message, related_ride_id, related_request_id)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [
+        req.userId,
+        'join_request_sent',
+        'Your join request has been sent. Waiting for the ride creator to respond.',
+        rideId,
+        joinRequest.request_id,
+      ]
+    );
 
     await client.query('COMMIT');
 
@@ -198,6 +242,32 @@ router.get('/my-requests', authMiddleware, async (req, res) => {
   }
 });
 
+// Check user's join request status for a specific ride
+router.get('/status/:rideId', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT jr.request_id,
+              (SELECT status FROM Request_Status_Log WHERE request_id = jr.request_id ORDER BY timestamp DESC LIMIT 1) as status
+       FROM Join_Request jr
+       WHERE jr.ride_id = $1 AND jr.partner_id = $2`,
+      [req.params.rideId, req.userId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.json({ hasRequested: false, status: null });
+    }
+
+    res.json({ 
+      hasRequested: true, 
+      status: result.rows[0].status,
+      requestId: result.rows[0].request_id
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to check join request status' });
+  }
+});
+
 // Accept a join request
 router.patch('/:requestId/accept', authMiddleware, async (req, res) => {
   const client = await pool.connect();
@@ -240,18 +310,25 @@ router.patch('/:requestId/accept', authMiddleware, async (req, res) => {
       [request.ride_id]
     );
 
-    // Create notification for partner (if notifications table exists)
-    // await client.query(
-    //   `INSERT INTO notifications (user_id, type, related_id, title, message)
-    //    VALUES ($1, $2, $3, $4, $5)`,
-    //   [
-    //     request.partner_id,
-    //     'join_request',
-    //     request.ride_id,
-    //     'Join Request Accepted',
-    //     'Your request to join the ride was accepted',
-    //   ]
-    // );
+    // Create notification for partner
+    await client.query(
+      `INSERT INTO Notification (user_id, type, message, related_ride_id, related_user_id, related_request_id)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [
+        request.partner_id,
+        'join_request_accepted',
+        'Your request to join the ride was accepted!',
+        request.ride_id,
+        req.userId,
+        req.params.requestId
+      ]
+    );
+
+    // Mark the original join_request notification as read
+    await client.query(
+      `UPDATE Notification SET is_read = true WHERE related_request_id = $1 AND type = 'join_request'`,
+      [req.params.requestId]
+    );
 
     await client.query('COMMIT');
 
@@ -291,22 +368,30 @@ router.patch('/:requestId/reject', authMiddleware, async (req, res) => {
     }
 
     const partnerId = requestResult.rows[0].partner_id;
+    const rideId = requestResult.rows[0].ride_id;
 
     // Update status
     await addRequestStatus(client, req.params.requestId, 'rejected');
 
-    // Create notification (if notifications table exists)
-    // await client.query(
-    //   `INSERT INTO notifications (user_id, type, related_id, title, message)
-    //    VALUES ($1, $2, $3, $4, $5)`,
-    //   [
-    //     partnerId,
-    //     'join_request',
-    //     req.params.requestId,
-    //     'Join Request Rejected',
-    //     'Your request to join the ride was rejected',
-    //   ]
-    // );
+    // Create notification
+    await client.query(
+      `INSERT INTO Notification (user_id, type, message, related_ride_id, related_user_id, related_request_id)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [
+        partnerId,
+        'join_request_rejected',
+        'Your request to join the ride was rejected',
+        rideId,
+        req.userId,
+        req.params.requestId
+      ]
+    );
+
+    // Mark the original join_request notification as read
+    await client.query(
+      `UPDATE Notification SET is_read = true WHERE related_request_id = $1 AND type = 'join_request'`,
+      [req.params.requestId]
+    );
 
     await client.query('COMMIT');
 

@@ -244,13 +244,15 @@ CREATE TABLE Notification (
     message TEXT NOT NULL,
     related_user_id INT,
     related_ride_id INT,
+    related_request_id INT,
     ride_uuid UUID,
     is_read BOOLEAN DEFAULT false,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 
     CONSTRAINT fk_notification_user FOREIGN KEY (user_id) REFERENCES "User"(user_id) ON DELETE CASCADE,
     CONSTRAINT fk_notification_related_user FOREIGN KEY (related_user_id) REFERENCES "User"(user_id) ON DELETE SET NULL,
-    CONSTRAINT fk_notification_related_ride FOREIGN KEY (related_ride_id) REFERENCES Ride(ride_id) ON DELETE SET NULL
+    CONSTRAINT fk_notification_related_ride FOREIGN KEY (related_ride_id) REFERENCES Ride(ride_id) ON DELETE SET NULL,
+    CONSTRAINT fk_notification_related_request FOREIGN KEY (related_request_id) REFERENCES Join_Request(request_id) ON DELETE SET NULL
 );
 
 -- =========================
