@@ -136,17 +136,24 @@ router.post('/', authMiddleware, async (req, res) => {
     // Create notification for ride creator
     console.log('Creating notification for ride creator:', rideResult.rows[0].creator_id);
     console.log('Join request ID:', joinRequest.request_id);
-    
+
+    const requesterResult = await client.query(
+      'SELECT name FROM "User" WHERE user_id = $1',
+      [req.userId]
+    );
+    const requesterName = requesterResult.rows[0]?.name || 'Someone';
+
     const notificationResult = await client.query(
-      `INSERT INTO Notification (user_id, type, message, related_ride_id, related_request_id)
-       VALUES ($1, $2, $3, $4, $5)
+      `INSERT INTO Notification (user_id, type, message, related_ride_id, related_request_id, related_user_id)
+       VALUES ($1, $2, $3, $4, $5, $6)
        RETURNING *`,
       [
         rideResult.rows[0].creator_id,
         'join_request',
-        'Someone wants to join your ride',
+        `${requesterName} wants to join your ride`,
         rideId,
         joinRequest.request_id,
+        req.userId,
       ]
     );
     

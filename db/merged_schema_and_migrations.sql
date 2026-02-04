@@ -235,8 +235,13 @@ CREATE TABLE Message (
     chat_id INT NOT NULL,
     sender_id INT NOT NULL,
     message_uuid UUID DEFAULT uuid_generate_v4(),
-    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    content TEXT,
+  timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  content TEXT,
+  media_url TEXT,
+  is_read BOOLEAN DEFAULT false,
+  is_deleted BOOLEAN DEFAULT false,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 
     CONSTRAINT fk_msg_chat FOREIGN KEY (chat_id) REFERENCES Chat(chat_id) ON DELETE CASCADE,
     CONSTRAINT fk_msg_sender FOREIGN KEY (sender_id) REFERENCES "User"(user_id) ON DELETE CASCADE
@@ -252,13 +257,15 @@ CREATE TABLE IF NOT EXISTS Notification (
     message TEXT NOT NULL,
     related_user_id INT,
     related_ride_id INT,
+  related_request_id INT,
     ride_uuid UUID,
     is_read BOOLEAN DEFAULT false,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 
     CONSTRAINT fk_notification_user FOREIGN KEY (user_id) REFERENCES "User"(user_id) ON DELETE CASCADE,
     CONSTRAINT fk_notification_related_user FOREIGN KEY (related_user_id) REFERENCES "User"(user_id) ON DELETE SET NULL,
-    CONSTRAINT fk_notification_related_ride FOREIGN KEY (related_ride_id) REFERENCES Ride(ride_id) ON DELETE SET NULL
+  CONSTRAINT fk_notification_related_ride FOREIGN KEY (related_ride_id) REFERENCES Ride(ride_id) ON DELETE SET NULL,
+  CONSTRAINT fk_notification_related_request FOREIGN KEY (related_request_id) REFERENCES Join_Request(request_id) ON DELETE SET NULL
 );
 
 -- =========================
@@ -365,6 +372,7 @@ ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
 CREATE INDEX IF NOT EXISTS idx_notification_user_id ON Notification(user_id);
 CREATE INDEX IF NOT EXISTS idx_notification_is_read ON Notification(is_read);
 CREATE INDEX IF NOT EXISTS idx_notification_created_at ON Notification(created_at);
+CREATE INDEX IF NOT EXISTS idx_notification_request ON Notification(related_request_id);
 
 -- Update trigger to set updated_at on Ride updates
 CREATE OR REPLACE FUNCTION update_ride_timestamp()
@@ -397,6 +405,7 @@ ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
 
 -- Add missing fields to Message table if they don't exist
 ALTER TABLE Message
+ADD COLUMN IF NOT EXISTS media_url TEXT,
 ADD COLUMN IF NOT EXISTS is_read BOOLEAN DEFAULT false,
 ADD COLUMN IF NOT EXISTS is_deleted BOOLEAN DEFAULT false,
 ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -603,6 +612,27 @@ $$ LANGUAGE plpgsql;
 
 -- Note: This assumes Join_Request table has a status column
 -- If using only Request_Status_Log for history, comment this out
+
+-- =========================
+-- MIGRATION: 004_add_request_id_to_notifications.sql
+-- =========================
+-- Add related_request_id to Notification table
+ALTER TABLE Notification
+ADD COLUMN IF NOT EXISTS related_request_id INT;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint WHERE conname = 'fk_notification_related_request'
+  ) THEN
+    ALTER TABLE Notification
+    ADD CONSTRAINT fk_notification_related_request
+    FOREIGN KEY (related_request_id) REFERENCES Join_Request(request_id) ON DELETE SET NULL;
+  END IF;
+END $$;
+
+-- Create index for faster lookups
+CREATE INDEX IF NOT EXISTS idx_notification_request ON Notification(related_request_id);
 
 -- ============================
 -- NOTIFICATION AUTO-CLEANUP

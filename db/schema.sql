@@ -229,6 +229,11 @@ CREATE TABLE Message (
     message_uuid UUID DEFAULT uuid_generate_v4(),
     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     content TEXT,
+    media_url TEXT,
+    is_read BOOLEAN DEFAULT false,
+    is_deleted BOOLEAN DEFAULT false,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 
     CONSTRAINT fk_msg_chat FOREIGN KEY (chat_id) REFERENCES Chat(chat_id) ON DELETE CASCADE,
     CONSTRAINT fk_msg_sender FOREIGN KEY (sender_id) REFERENCES "User"(user_id) ON DELETE CASCADE

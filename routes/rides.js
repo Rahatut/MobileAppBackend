@@ -111,7 +111,9 @@ router.post('/', authMiddleware, async (req, res) => {
     await addRideStatus(client, ride.ride_id, 'unactive');
 
     const fullRideResult = await client.query(
-      `SELECT r.*, u.name, u.username, u.user_uuid, u.avatar_url, u.avg_rating,
+      `SELECT r.*, 
+              to_char(r.start_time AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as start_time,
+              u.name, u.username, u.user_uuid, u.avatar_url, u.avg_rating,
               sl.name as start_name, sl.address as start_address, sl.latitude as start_lat, sl.longitude as start_lng,
               dl.name as dest_name, dl.address as dest_address, dl.latitude as dest_lat, dl.longitude as dest_lng,
               (SELECT status FROM Ride_Status_Log WHERE ride_id = r.ride_id ORDER BY timestamp DESC LIMIT 1) as current_status
@@ -142,7 +144,9 @@ router.get('/', authMiddleware, async (req, res) => {
     const offset = (page - 1) * limit;
 
     let query = `
-      SELECT r.*, u.name, u.username, u.avatar_url, u.avg_rating,
+      SELECT r.*, 
+             to_char(r.start_time AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as start_time,
+             u.name, u.username, u.avatar_url, u.avg_rating,
              sl.name as start_name, sl.address as start_address, sl.latitude as start_lat, sl.longitude as start_lng,
              dl.name as dest_name, dl.address as dest_address, dl.latitude as dest_lat, dl.longitude as dest_lng,
              (SELECT status FROM Ride_Status_Log WHERE ride_id = r.ride_id ORDER BY timestamp DESC LIMIT 1) as current_status
@@ -206,6 +210,7 @@ router.get('/driver/my-rides', authMiddleware, async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT r.*, 
+              to_char(r.start_time AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as start_time,
               u.name, u.username, u.user_uuid, u.avatar_url, u.avg_rating,
               sl.name as start_name, sl.address as start_address, sl.latitude as start_lat, sl.longitude as start_lng,
               dl.name as dest_name, dl.address as dest_address, dl.latitude as dest_lat, dl.longitude as dest_lng,
@@ -232,6 +237,7 @@ router.get('/passenger/my-rides', authMiddleware, async (req, res) => {
     console.log('🔵 Fetching joined rides for user:', req.userId);
     const result = await pool.query(
       `SELECT r.*, 
+              to_char(r.start_time AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as start_time,
               u.name, u.username, u.user_uuid, u.avatar_url, u.avg_rating,
               sl.name as start_name, sl.address as start_address, sl.latitude as start_lat, sl.longitude as start_lng,
               dl.name as dest_name, dl.address as dest_address, dl.latitude as dest_lat, dl.longitude as dest_lng,
@@ -263,7 +269,9 @@ router.get('/:identifier', async (req, res) => {
     const isUuid = identifier.includes('-');
     
     const query = `
-      SELECT r.*, u.name, u.username, u.user_uuid, u.avatar_url, u.avg_rating,
+      SELECT r.*, 
+             to_char(r.start_time AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as start_time,
+             u.name, u.username, u.user_uuid, u.avatar_url, u.avg_rating,
              sl.name as start_name, sl.address as start_address, sl.latitude as start_lat, sl.longitude as start_lng,
              dl.name as dest_name, dl.address as dest_address, dl.latitude as dest_lat, dl.longitude as dest_lng,
              (SELECT status FROM Ride_Status_Log WHERE ride_id = r.ride_id ORDER BY timestamp DESC LIMIT 1) as current_status
@@ -471,6 +479,52 @@ router.post('/:rideId/calculate-fare', async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Failed to calculate fare' });
+  }
+});
+
+// Delete a past ride (creator only)
+router.delete('/:rideId', authMiddleware, async (req, res) => {
+  const { rideId } = req.params;
+  const client = await pool.connect();
+
+  try {
+    await client.query('BEGIN');
+
+    const isNumericId = /^\d+$/.test(String(rideId));
+    const rideResult = await client.query(
+      `SELECT r.ride_id, r.creator_id,
+              (SELECT status FROM Ride_Status_Log WHERE ride_id = r.ride_id ORDER BY timestamp DESC LIMIT 1) as current_status
+       FROM Ride r
+       WHERE ${isNumericId ? 'r.ride_id = $1' : 'r.ride_uuid = $1'}`,
+      [rideId]
+    );
+
+    if (rideResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Ride not found' });
+    }
+
+    const ride = rideResult.rows[0];
+    if (Number(ride.creator_id) !== Number(req.userId)) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ error: 'Not authorized to delete this ride' });
+    }
+
+    if (!['completed', 'cancelled', 'expired'].includes(ride.current_status)) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Only past rides can be deleted' });
+    }
+
+    await client.query('DELETE FROM Ride WHERE ride_id = $1', [ride.ride_id]);
+
+    await client.query('COMMIT');
+    return res.json({ message: 'Ride deleted' });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error(err);
+    return res.status(500).json({ error: 'Failed to delete ride' });
+  } finally {
+    client.release();
   }
 });
 
