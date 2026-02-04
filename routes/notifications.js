@@ -14,8 +14,10 @@ router.get('/', authMiddleware, async (req, res) => {
 
     let query = `
       SELECT n.*, 
+             to_char(n.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as created_at,
              u.name as user_name, u.username as user_username, u.avatar_url as user_avatar,
-             r.start_time as ride_start_time, r.transport_mode as ride_transport
+             to_char(r.start_time AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as ride_start_time,
+             r.transport_mode as ride_transport
       FROM Notification n
       LEFT JOIN "User" u ON n.related_user_id = u.user_id
       LEFT JOIN Ride r ON n.related_ride_id = r.ride_id

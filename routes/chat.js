@@ -13,7 +13,8 @@ router.get('/', authMiddleware, async (req, res) => {
     const result = await pool.query(
       `SELECT DISTINCT c.*, 
               (SELECT content FROM Message WHERE chat_id = c.chat_id ORDER BY created_at DESC LIMIT 1) as last_message,
-              (SELECT created_at FROM Message WHERE chat_id = c.chat_id ORDER BY created_at DESC LIMIT 1) as last_message_time,
+              (SELECT to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
+               FROM Message WHERE chat_id = c.chat_id ORDER BY created_at DESC LIMIT 1) as last_message_time,
               (SELECT COUNT(*) FROM Message WHERE chat_id = c.chat_id AND is_read = false AND sender_id != $1) as unread_count
        FROM Chat c
        JOIN Chat_Participants cp ON c.chat_id = cp.chat_id
@@ -48,7 +49,16 @@ router.get('/:chatId/messages', authMiddleware, async (req, res) => {
     }
 
     const messages = await pool.query(
-      `SELECT m.*, u.name, u.username, u.avatar_url
+      `SELECT m.message_id,
+              m.chat_id,
+              m.sender_id,
+              m.content,
+              m.media_url,
+              m.is_read,
+              to_char(m.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as created_at,
+              u.name,
+              u.username,
+              u.avatar_url
        FROM Message m
        JOIN "User" u ON m.sender_id = u.user_id
        WHERE m.chat_id = $1
@@ -153,7 +163,13 @@ router.post('/:chatId/messages', authMiddleware, async (req, res) => {
     const result = await client.query(
       `INSERT INTO Message (chat_id, sender_id, content, media_url, is_read, created_at) 
        VALUES ($1, $2, $3, $4, false, CURRENT_TIMESTAMP) 
-       RETURNING *`,
+       RETURNING message_id,
+                 chat_id,
+                 sender_id,
+                 content,
+                 media_url,
+                 is_read,
+                 to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as created_at`,
       [chatId, req.userId, content, mediaUrl]
     );
 
@@ -253,7 +269,7 @@ router.get('/:chatId', authMiddleware, async (req, res) => {
     }
 
     const participantsResult = await pool.query(
-      `SELECT cp.*, u.name, u.username, u.avatar_url
+      `SELECT cp.*, u.name, u.username, u.avatar_url, u.phone
        FROM Chat_Participants cp
        JOIN "User" u ON cp.participant_id = u.user_id
        WHERE cp.chat_id = $1`,

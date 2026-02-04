@@ -111,7 +111,9 @@ router.post('/', authMiddleware, async (req, res) => {
     await addRideStatus(client, ride.ride_id, 'unactive');
 
     const fullRideResult = await client.query(
-      `SELECT r.*, u.name, u.username, u.user_uuid, u.avatar_url, u.avg_rating,
+      `SELECT r.*, 
+              to_char(r.start_time AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as start_time,
+              u.name, u.username, u.user_uuid, u.avatar_url, u.avg_rating,
               sl.name as start_name, sl.address as start_address, sl.latitude as start_lat, sl.longitude as start_lng,
               dl.name as dest_name, dl.address as dest_address, dl.latitude as dest_lat, dl.longitude as dest_lng,
               (SELECT status FROM Ride_Status_Log WHERE ride_id = r.ride_id ORDER BY timestamp DESC LIMIT 1) as current_status
@@ -142,7 +144,9 @@ router.get('/', authMiddleware, async (req, res) => {
     const offset = (page - 1) * limit;
 
     let query = `
-      SELECT r.*, u.name, u.username, u.avatar_url, u.avg_rating,
+      SELECT r.*, 
+             to_char(r.start_time AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as start_time,
+             u.name, u.username, u.avatar_url, u.avg_rating,
              sl.name as start_name, sl.address as start_address, sl.latitude as start_lat, sl.longitude as start_lng,
              dl.name as dest_name, dl.address as dest_address, dl.latitude as dest_lat, dl.longitude as dest_lng,
              (SELECT status FROM Ride_Status_Log WHERE ride_id = r.ride_id ORDER BY timestamp DESC LIMIT 1) as current_status
@@ -206,6 +210,7 @@ router.get('/driver/my-rides', authMiddleware, async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT r.*, 
+              to_char(r.start_time AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as start_time,
               u.name, u.username, u.user_uuid, u.avatar_url, u.avg_rating,
               sl.name as start_name, sl.address as start_address, sl.latitude as start_lat, sl.longitude as start_lng,
               dl.name as dest_name, dl.address as dest_address, dl.latitude as dest_lat, dl.longitude as dest_lng,
@@ -232,6 +237,7 @@ router.get('/passenger/my-rides', authMiddleware, async (req, res) => {
     console.log('🔵 Fetching joined rides for user:', req.userId);
     const result = await pool.query(
       `SELECT r.*, 
+              to_char(r.start_time AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as start_time,
               u.name, u.username, u.user_uuid, u.avatar_url, u.avg_rating,
               sl.name as start_name, sl.address as start_address, sl.latitude as start_lat, sl.longitude as start_lng,
               dl.name as dest_name, dl.address as dest_address, dl.latitude as dest_lat, dl.longitude as dest_lng,
@@ -263,7 +269,9 @@ router.get('/:identifier', async (req, res) => {
     const isUuid = identifier.includes('-');
     
     const query = `
-      SELECT r.*, u.name, u.username, u.user_uuid, u.avatar_url, u.avg_rating,
+      SELECT r.*, 
+             to_char(r.start_time AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as start_time,
+             u.name, u.username, u.user_uuid, u.avatar_url, u.avg_rating,
              sl.name as start_name, sl.address as start_address, sl.latitude as start_lat, sl.longitude as start_lng,
              dl.name as dest_name, dl.address as dest_address, dl.latitude as dest_lat, dl.longitude as dest_lng,
              (SELECT status FROM Ride_Status_Log WHERE ride_id = r.ride_id ORDER BY timestamp DESC LIMIT 1) as current_status

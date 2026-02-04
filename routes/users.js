@@ -30,15 +30,71 @@ router.get('/me', authMiddleware, async (req, res) => {
 });
 
 // Get user profile by ID or UUID
+router.get('/:identifier/ride-stats', async (req, res) => {
+  try {
+    const { identifier } = req.params;
+    const isUuid = identifier.includes('-');
+    const isNumeric = /^\d+$/.test(identifier);
+
+    const userIdQuery = isUuid
+      ? 'SELECT user_id FROM "User" WHERE user_uuid = $1'
+      : isNumeric
+        ? 'SELECT user_id FROM "User" WHERE user_id = $1'
+        : 'SELECT user_id FROM "User" WHERE username = $1';
+
+    const userResult = await pool.query(userIdQuery, [identifier]);
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const userId = userResult.rows[0].user_id;
+
+    const createdResult = await pool.query(
+      'SELECT COUNT(*) as created_count FROM Ride WHERE creator_id = $1',
+      [userId]
+    );
+
+    const joinedResult = await pool.query(
+      `SELECT COUNT(*) as joined_count
+       FROM Join_Request jr
+       WHERE jr.partner_id = $1
+       AND (SELECT status FROM Request_Status_Log WHERE request_id = jr.request_id ORDER BY timestamp DESC LIMIT 1) = 'accepted'`,
+      [userId]
+    );
+
+    res.json({
+      createdCount: parseInt(createdResult.rows[0].created_count, 10),
+      joinedCount: parseInt(joinedResult.rows[0].joined_count, 10),
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch ride stats' });
+  }
+});
+
 router.get('/:identifier', async (req, res) => {
   try {
     const { identifier } = req.params;
-    
-    // Check if UUID or integer ID
+
     const isUuid = identifier.includes('-');
+    const isNumeric = /^\d+$/.test(identifier);
     const query = isUuid 
-      ? 'SELECT user_id, user_uuid, username, name, gender, profile_bio, avg_rating, avatar_url, total_rides, university, department, address, fb FROM "User" WHERE user_uuid = $1'
-      : 'SELECT user_id, user_uuid, username, name, gender, profile_bio, avg_rating, avatar_url, total_rides, university, department, address, fb FROM "User" WHERE user_id = $1';
+      ? `SELECT u.user_id, u.user_uuid, u.username, u.name, u.gender, u.profile_bio, u.avg_rating, u.avatar_url, u.total_rides,
+               u.university, u.department, u.address, u.fb, u.phone, a.email
+         FROM "User" u
+         LEFT JOIN Auth a ON u.user_id = a.user_id
+         WHERE u.user_uuid = $1`
+      : isNumeric
+        ? `SELECT u.user_id, u.user_uuid, u.username, u.name, u.gender, u.profile_bio, u.avg_rating, u.avatar_url, u.total_rides,
+                 u.university, u.department, u.address, u.fb, u.phone, a.email
+           FROM "User" u
+           LEFT JOIN Auth a ON u.user_id = a.user_id
+           WHERE u.user_id = $1`
+        : `SELECT u.user_id, u.user_uuid, u.username, u.name, u.gender, u.profile_bio, u.avg_rating, u.avatar_url, u.total_rides,
+                 u.university, u.department, u.address, u.fb, u.phone, a.email
+           FROM "User" u
+           LEFT JOIN Auth a ON u.user_id = a.user_id
+           WHERE u.username = $1`;
 
     const result = await pool.query(query, [identifier]);
 
