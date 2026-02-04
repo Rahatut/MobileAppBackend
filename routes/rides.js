@@ -482,4 +482,50 @@ router.post('/:rideId/calculate-fare', async (req, res) => {
   }
 });
 
+// Delete a past ride (creator only)
+router.delete('/:rideId', authMiddleware, async (req, res) => {
+  const { rideId } = req.params;
+  const client = await pool.connect();
+
+  try {
+    await client.query('BEGIN');
+
+    const isNumericId = /^\d+$/.test(String(rideId));
+    const rideResult = await client.query(
+      `SELECT r.ride_id, r.creator_id,
+              (SELECT status FROM Ride_Status_Log WHERE ride_id = r.ride_id ORDER BY timestamp DESC LIMIT 1) as current_status
+       FROM Ride r
+       WHERE ${isNumericId ? 'r.ride_id = $1' : 'r.ride_uuid = $1'}`,
+      [rideId]
+    );
+
+    if (rideResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Ride not found' });
+    }
+
+    const ride = rideResult.rows[0];
+    if (Number(ride.creator_id) !== Number(req.userId)) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ error: 'Not authorized to delete this ride' });
+    }
+
+    if (!['completed', 'cancelled', 'expired'].includes(ride.current_status)) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Only past rides can be deleted' });
+    }
+
+    await client.query('DELETE FROM Ride WHERE ride_id = $1', [ride.ride_id]);
+
+    await client.query('COMMIT');
+    return res.json({ message: 'Ride deleted' });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error(err);
+    return res.status(500).json({ error: 'Failed to delete ride' });
+  } finally {
+    client.release();
+  }
+});
+
 module.exports = router;
