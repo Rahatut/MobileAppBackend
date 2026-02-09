@@ -97,38 +97,37 @@ CREATE TABLE Auth (
 -- =========================
 -- FRIEND
 -- =========================
-CREATE TABLE Friend (
-    user1_id INT NOT NULL,
-    user2_id INT NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (user1_id, user2_id),
 
-    CONSTRAINT fk_friend_user1 FOREIGN KEY (user1_id) REFERENCES "User"(user_id) ON DELETE CASCADE,
-    CONSTRAINT fk_friend_user2 FOREIGN KEY (user2_id) REFERENCES "User"(user_id) ON DELETE CASCADE
+CREATE TABLE IF NOT EXISTS Friend (
+  user1_id INT NOT NULL,
+  user2_id INT NOT NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (user1_id, user2_id),
+  CONSTRAINT fk_friend_user1 FOREIGN KEY (user1_id) REFERENCES "User"(user_id) ON DELETE CASCADE,
+  CONSTRAINT fk_friend_user2 FOREIGN KEY (user2_id) REFERENCES "User"(user_id) ON DELETE CASCADE
 );
 
 -- =========================
 -- FRIEND REQUEST
 -- =========================
-CREATE TABLE Friend_Request (
-    request_id INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    sender_id INT NOT NULL,
-    receiver_id INT NOT NULL,
-    status_id INT,
-    request_uuid UUID UNIQUE DEFAULT uuid_generate_v4(),
 
-    CONSTRAINT fk_fr_sender FOREIGN KEY (sender_id) REFERENCES "User"(user_id) ON DELETE CASCADE,
-    CONSTRAINT fk_fr_receiver FOREIGN KEY (receiver_id) REFERENCES "User"(user_id) ON DELETE CASCADE
+CREATE TABLE IF NOT EXISTS Friend_Request (
+  request_id SERIAL PRIMARY KEY,
+  sender_id INT NOT NULL,
+  receiver_id INT NOT NULL,
+  status_id INT,
+  request_uuid UUID UNIQUE DEFAULT uuid_generate_v4(),
+  CONSTRAINT fk_fr_sender FOREIGN KEY (sender_id) REFERENCES "User"(user_id) ON DELETE CASCADE,
+  CONSTRAINT fk_fr_receiver FOREIGN KEY (receiver_id) REFERENCES "User"(user_id) ON DELETE CASCADE
 );
 
-CREATE TABLE Friend_Request_Status_Log (
-    log_id INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    friend_request_id INT NOT NULL,
-    status request_status_enum,
-    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 
-    CONSTRAINT fk_fr_log
-        FOREIGN KEY (friend_request_id) REFERENCES Friend_Request(request_id) ON DELETE CASCADE
+CREATE TABLE IF NOT EXISTS Friend_Request_Status_Log (
+  log_id SERIAL PRIMARY KEY,
+  friend_request_id INT NOT NULL,
+  status request_status_enum,
+  timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT fk_fr_log FOREIGN KEY (friend_request_id) REFERENCES Friend_Request(request_id) ON DELETE CASCADE
 );
 
 -- =========================
@@ -617,8 +616,16 @@ $$ LANGUAGE plpgsql;
 -- MIGRATION: 004_add_request_id_to_notifications.sql
 -- =========================
 -- Add related_request_id to Notification table
+
+-- Add related_request_id to Notification table
 ALTER TABLE Notification
 ADD COLUMN IF NOT EXISTS related_request_id INT;
+
+-- Clean up invalid related_request_id values before adding the constraint
+UPDATE Notification
+SET related_request_id = NULL
+WHERE related_request_id IS NOT NULL
+  AND related_request_id NOT IN (SELECT request_id FROM Join_Request);
 
 DO $$
 BEGIN
