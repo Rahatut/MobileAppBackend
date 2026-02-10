@@ -275,6 +275,32 @@ router.get('/status/:rideId', authMiddleware, async (req, res) => {
   }
 });
 
+// Get a single join request by ID
+router.get('/:id', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT jr.*, 
+              li1.latitude as start_lat, li1.longitude as start_lng,
+              li2.latitude as dest_lat, li2.longitude as dest_lng,
+              (SELECT status FROM Request_Status_Log WHERE request_id = jr.request_id ORDER BY timestamp DESC LIMIT 1) as status
+       FROM Join_Request jr
+       LEFT JOIN Location_Info li1 ON jr.start_location_id = li1.location_id
+       LEFT JOIN Location_Info li2 ON jr.end_location_id = li2.location_id
+       WHERE jr.request_id = $1`,
+      [req.params.id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Join request not found' });
+    }
+
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to get join request' });
+  }
+});
+
 // Accept a join request
 router.patch('/:requestId/accept', authMiddleware, async (req, res) => {
   const client = await pool.connect();

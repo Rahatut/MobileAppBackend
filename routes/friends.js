@@ -4,6 +4,27 @@ const authMiddleware = require('../middleware/auth');
 
 const router = express.Router();
 
+// Get a user's friends
+router.get('/:userId', authMiddleware, async (req, res) => {
+  try {
+    const userId = parseInt(req.params.userId, 10);
+    if (isNaN(userId)) {
+      return res.status(400).json({ error: 'Invalid userId' });
+    }
+    // Find all friends where user is user1 or user2
+    const result = await pool.query(
+      `SELECT u.user_id, u.user_uuid, u.username, u.name, u.avatar_url, u.avg_rating
+       FROM Friend f
+       JOIN "User" u ON (u.user_id = CASE WHEN f.user1_id = $1 THEN f.user2_id ELSE f.user1_id END)
+       WHERE f.user1_id = $1 OR f.user2_id = $1`,
+      [userId]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch friends' });
+  }
+});
 // Helper function to add friend request status
 async function addFriendRequestStatus(client, requestId, status) {
   await client.query(
@@ -23,58 +44,39 @@ async function getCurrentFriendRequestStatus(client, requestId) {
   return result.rows.length > 0 ? result.rows[0].status : null;
 }
 
+
 // Send friend request
 router.post('/request', authMiddleware, async (req, res) => {
   const client = await pool.connect();
-  
   try {
-    const { receiverId } = req.body;
-
-    if (!receiverId) {
-      return res.status(400).json({ error: 'receiverId required' });
-    }
-
-    if (receiverId === req.userId) {
-      return res.status(400).json({ error: 'Cannot send friend request to yourself' });
-    }
-
     await client.query('BEGIN');
-
-    // Check if already friends
-    const friendCheck = await client.query(
-      'SELECT * FROM Friend WHERE (user1_id = $1 AND user2_id = $2) OR (user1_id = $2 AND user2_id = $1)',
+    const { receiverId } = req.body;
+    // Check for existing request
+    const existing = await client.query(
+      'SELECT * FROM Friend_Request WHERE sender_id = $1 AND receiver_id = $2',
       [req.userId, receiverId]
     );
-
-    if (friendCheck.rows.length > 0) {
-      await client.query('ROLLBACK');
-      return res.status(400).json({ error: 'Already friends' });
-    }
-
-    // Check if request already exists
-    const requestCheck = await client.query(
-      'SELECT * FROM Friend_Request WHERE (sender_id = $1 AND receiver_id = $2) OR (sender_id = $2 AND receiver_id = $1)',
-      [req.userId, receiverId]
-    );
-
-    if (requestCheck.rows.length > 0) {
+    if (existing.rows.length > 0) {
       await client.query('ROLLBACK');
       return res.status(400).json({ error: 'Friend request already exists' });
     }
-
     // Create friend request
     const result = await client.query(
       'INSERT INTO Friend_Request (sender_id, receiver_id) VALUES ($1, $2) RETURNING *',
       [req.userId, receiverId]
     );
-
     const friendRequest = result.rows[0];
-
     // Add initial status
     await addFriendRequestStatus(client, friendRequest.request_id, 'pending');
-
+    // Send notification to receiver
+    const senderResult = await client.query('SELECT name FROM "User" WHERE user_id = $1', [req.userId]);
+    const senderName = senderResult.rows[0]?.name || 'Someone';
+    const notifMessage = `${senderName} sent you a friend request.`;
+    await client.query(
+      `INSERT INTO Notification (user_id, type, message, related_user_id, related_request_id) VALUES ($1, $2, $3, $4, $5)`,
+      [receiverId, 'friend_request', notifMessage, req.userId, null]
+    );
     await client.query('COMMIT');
-
     res.status(201).json({ message: 'Friend request sent', friendRequest });
   } catch (err) {
     await client.query('ROLLBACK');

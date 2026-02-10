@@ -1,8 +1,66 @@
+
 const express = require('express');
 const pool = require('../db/pool');
 const authMiddleware = require('../middleware/auth');
 
 const router = express.Router();
+
+// Request to join a ride with custom pickup/dropoff
+router.post('/:rideId/join', authMiddleware, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { startLocation, destLocation } = req.body;
+    const rideId = req.params.rideId;
+    const partnerId = req.userId;
+
+    if (!startLocation || !destLocation) {
+      return res.status(400).json({ error: 'Missing pickup/dropoff location' });
+    }
+
+    await client.query('BEGIN');
+
+    // Insert or get pickup location
+    const startLocationId = await getOrCreateLocation(
+      client,
+      startLocation.name || startLocation.address,
+      startLocation.address,
+      startLocation.latitude,
+      startLocation.longitude
+    );
+
+    // Insert or get dropoff location
+    const destLocationId = await getOrCreateLocation(
+      client,
+      destLocation.name || destLocation.address,
+      destLocation.address,
+      destLocation.latitude,
+      destLocation.longitude
+    );
+
+    // Create join request
+    const joinResult = await client.query(
+      `INSERT INTO Join_Request (ride_id, partner_id, start_location_id, dest_location_id, status_id)
+       VALUES ($1, $2, $3, $4, NULL)
+       RETURNING request_id`,
+      [rideId, partnerId, startLocationId, destLocationId]
+    );
+
+    // Add initial status log
+    await client.query(
+      'INSERT INTO Request_Status_Log (request_id, status) VALUES ($1, $2)',
+      [joinResult.rows[0].request_id, 'pending']
+    );
+
+    await client.query('COMMIT');
+    res.status(201).json({ message: 'Join request submitted' });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error(err);
+    res.status(500).json({ error: 'Failed to submit join request' });
+  } finally {
+    client.release();
+  }
+});
 
 // Helper function to insert or get location
 async function getOrCreateLocation(client, name, address, latitude, longitude) {
@@ -274,19 +332,28 @@ router.get('/:identifier', async (req, res) => {
       return res.status(404).json({ error: 'Ride not found' });
     }
 
-    // Get passengers/partners for this ride
+    // Get passengers/partners for this ride, including pickup/dropoff coordinates
     const passengersResult = await pool.query(
       `SELECT u.user_id, u.user_uuid, u.name, u.username, u.avatar_url, u.avg_rating,
-              (SELECT status FROM Request_Status_Log WHERE request_id = jr.request_id ORDER BY timestamp DESC LIMIT 1) as status
+              (SELECT status FROM Request_Status_Log WHERE request_id = jr.request_id ORDER BY timestamp DESC LIMIT 1) as status,
+              sl.name as start_name, sl.address as start_address, sl.latitude as start_lat, sl.longitude as start_lng,
+              dl.name as dest_name, dl.address as dest_address, dl.latitude as dest_lat, dl.longitude as dest_lng
        FROM Join_Request jr
        JOIN "User" u ON jr.partner_id = u.user_id
+       LEFT JOIN Location_Info sl ON jr.start_location_id = sl.location_id
+       LEFT JOIN Location_Info dl ON jr.dest_location_id = dl.location_id
        WHERE jr.ride_id = $1 
        AND (SELECT status FROM Request_Status_Log WHERE request_id = jr.request_id ORDER BY timestamp DESC LIMIT 1) = 'accepted'`,
       [result.rows[0].ride_id]
     );
 
+    // Add totalPassengers to response
+    const totalPassengers = result.rows[0].total_passengers || result.rows[0].totalPassengers || result.rows[0].available_seats || 0;
     res.json({
-      ride: result.rows[0],
+      ride: {
+        ...result.rows[0],
+        totalPassengers,
+      },
       passengers: passengersResult.rows,
     });
   } catch (err) {
