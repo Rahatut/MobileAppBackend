@@ -142,6 +142,18 @@ CREATE TABLE Location_Info (
     longitude DECIMAL(9,6)
 );
 
+-- Add geometry column to Location_Info
+ALTER TABLE Location_Info
+ADD COLUMN geom geometry(Point, 4326);
+
+-- Populate the new geom column from existing lat/lng
+UPDATE Location_Info
+SET geom = ST_SetSRID(ST_MakePoint(longitude, latitude), 4326)
+WHERE latitude IS NOT NULL AND longitude IS NOT NULL;
+
+-- Create spatial index
+CREATE INDEX idx_location_info_geom ON Location_Info USING GIST (geom);
+
 -- =========================
 -- RIDE
 -- =========================
@@ -762,6 +774,131 @@ CREATE TRIGGER trigger_validate_rating_participation
 BEFORE INSERT ON Rating
 FOR EACH ROW
 EXECUTE FUNCTION validate_rating_participation();
+
+-- =========================
+-- FUNCTION: get_available_rides_filtered
+-- =========================
+CREATE OR REPLACE FUNCTION get_available_rides_filtered(
+    p_start_lat double precision DEFAULT NULL,
+    p_start_lng double precision DEFAULT NULL,
+    p_end_lat double precision DEFAULT NULL,
+    p_end_lng double precision DEFAULT NULL,
+    p_radius_km double precision DEFAULT 5,
+    p_transport_mode transport_mode_enum DEFAULT NULL,
+    p_gender_preference gender_enum DEFAULT NULL,
+    p_after_date timestamptz DEFAULT NULL,
+    p_before_date timestamptz DEFAULT NULL
+)
+RETURNS TABLE (
+    ride_id integer,
+    creator_id integer,
+    start_location_id integer,
+    dest_location_id integer,
+    status_log_id integer,
+    ride_uuid uuid,
+    route_polyline text,
+    created_at timestamptz,
+    start_time timestamptz,
+    gender_preference gender_enum,
+    preference_notes text,
+    transport_mode transport_mode_enum,
+    ride_provider ride_provider_enum,
+    fare numeric,
+    available_seats integer,
+    status text,
+    actual_fare numeric,
+    completion_time timestamptz,
+    trip_duration_minutes integer,
+    updated_at timestamptz,
+
+    creator_name text,
+    creator_username text,
+    creator_user_uuid uuid,
+    creator_avatar_url text,
+    creator_avg_rating numeric,
+
+    start_name text,
+    start_address text,
+    start_lat double precision,
+    start_lng double precision,
+
+    dest_name text,
+    dest_address text,
+    dest_lat double precision,
+    dest_lng double precision
+)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    start_search_point geometry;
+    end_search_point geometry;
+BEGIN
+    IF p_start_lat IS NOT NULL AND p_start_lng IS NOT NULL THEN
+        start_search_point :=
+            ST_SetSRID(ST_MakePoint(p_start_lng, p_start_lat), 4326);
+    END IF;
+
+    IF p_end_lat IS NOT NULL AND p_end_lng IS NOT NULL THEN
+        end_search_point :=
+            ST_SetSRID(ST_MakePoint(p_end_lng, p_end_lat), 4326);
+    END IF;
+
+    RETURN QUERY
+    SELECT
+        r.ride_id,
+        r.creator_id,
+        r.start_location_id,
+        r.dest_location_id,
+        r.status_log_id,
+        r.ride_uuid,
+        r.route_polyline,
+        -- convert to UTC if you want a timestamp without time zone:
+        (r.created_at AT TIME ZONE 'UTC') AS created_at,
+        (r.start_time AT TIME ZONE 'UTC') AS start_time,
+        r.gender_preference,
+        r.preference_notes::text,
+        r.transport_mode,
+        r.ride_provider,
+        r.fare,
+        r.available_seats,
+        r.status::text,
+        r.actual_fare,
+        (r.completion_time AT TIME ZONE 'UTC') AS completion_time,
+        r.trip_duration_minutes,
+        (r.updated_at AT TIME ZONE 'UTC') AS updated_at,
+
+        u.name::text,
+        u.username::text,
+        u.user_uuid,
+        u.avatar_url::text,
+        u.avg_rating,
+
+        ls.name::text,
+        ls.address::text,
+        ls.latitude::double precision,
+        ls.longitude::double precision,
+
+        ld.name::text,
+        ld.address::text,
+        ld.latitude::double precision,
+        ld.longitude::double precision
+    FROM Ride r
+    JOIN "User" u ON u.user_id = r.creator_id
+    JOIN Location_Info ls ON ls.location_id = r.start_location_id
+    JOIN Location_Info ld ON ld.location_id = r.dest_location_id
+    WHERE
+        r.status = 'unactive'
+        AND (start_search_point IS NULL
+             OR ST_DWithin(ls.geom, start_search_point, p_radius_km * 1000))
+        AND (end_search_point IS NULL
+             OR ST_DWithin(ld.geom, end_search_point, p_radius_km * 1000))
+        AND (p_transport_mode IS NULL OR r.transport_mode = p_transport_mode)
+        AND (p_gender_preference IS NULL OR r.gender_preference = p_gender_preference)
+        AND (p_after_date IS NULL OR r.start_time >= p_after_date)
+        AND (p_before_date IS NULL OR r.start_time <= p_before_date);
+END;
+$$;
+
 
 -- ============================
 -- HELPFUL VIEWS

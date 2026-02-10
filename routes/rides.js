@@ -140,64 +140,50 @@ router.post('/', authMiddleware, async (req, res) => {
 // Get all active rides (with optional filters)
 router.get('/', authMiddleware, async (req, res) => {
   try {
-    const { transportMode, genderPreference, afterDate, beforeDate, page = 1, limit = 10 } = req.query;
-    const offset = (page - 1) * limit;
+    const {
+      transportMode,
+      genderPreference,
+      afterDate,
+      beforeDate,
+      startLocationLat,
+      startLocationLng,
+      endLocationLat,
+      endLocationLng,
+      radiusKm,
+      page = 1,
+      limit = 10
+    } = req.query;
 
-    let query = `
-      SELECT r.*, 
-             to_char(r.start_time AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as start_time,
-             u.name, u.username, u.avatar_url, u.avg_rating,
-             sl.name as start_name, sl.address as start_address, sl.latitude as start_lat, sl.longitude as start_lng,
-             dl.name as dest_name, dl.address as dest_address, dl.latitude as dest_lat, dl.longitude as dest_lng,
-             (SELECT status FROM Ride_Status_Log WHERE ride_id = r.ride_id ORDER BY timestamp DESC LIMIT 1) as current_status
-      FROM Ride r
-      JOIN "User" u ON r.creator_id = u.user_id
-      LEFT JOIN Location_Info sl ON r.start_location_id = sl.location_id
-      LEFT JOIN Location_Info dl ON r.dest_location_id = dl.location_id
-      WHERE r.available_seats > 0
-      AND r.creator_id != $1
-      AND NOT EXISTS (
-        SELECT 1 FROM Join_Request jr 
-        WHERE jr.ride_id = r.ride_id 
-        AND jr.partner_id = $1
-        AND (SELECT status FROM Request_Status_Log WHERE request_id = jr.request_id ORDER BY timestamp DESC LIMIT 1) IN ('pending', 'accepted')
-      )
-    `;
-    const params = [req.userId];
+    const result = await pool.query(
+      `SELECT * FROM get_available_rides_filtered(
+        $1::double precision, $2::double precision,
+        $3::double precision, $4::double precision,
+        $5::double precision,
+        $6::transport_mode_enum, $7::gender_enum,
+        $8::timestamp with time zone, $9::timestamp with time zone
+      )`,
+      [
+        startLocationLat ? parseFloat(startLocationLat) : null,
+        startLocationLng ? parseFloat(startLocationLng) : null,
+        endLocationLat ? parseFloat(endLocationLat) : null,
+        endLocationLng ? parseFloat(endLocationLng) : null,
+        radiusKm ? parseFloat(radiusKm) : null,
+        transportMode || null,
+        genderPreference || null,
+        afterDate ? new Date(afterDate).toISOString() : null,
+        beforeDate ? new Date(beforeDate).toISOString() : null,
+      ]
+    );
 
-    // Filter by current status (active rides only)
-    query += ` AND (SELECT status FROM Ride_Status_Log WHERE ride_id = r.ride_id ORDER BY timestamp DESC LIMIT 1) = 'unactive'`;
-
-    if (transportMode) {
-      query += ` AND r.transport_mode = $${params.length + 1}`;
-      params.push(transportMode);
-    }
-
-    if (genderPreference) {
-      query += ` AND (r.gender_preference IS NULL OR r.gender_preference = $${params.length + 1})`;
-      params.push(genderPreference);
-    }
-
-    if (afterDate) {
-      query += ` AND r.start_time >= $${params.length + 1}`;
-      params.push(afterDate);
-    }
-
-    if (beforeDate) {
-      query += ` AND r.start_time <= $${params.length + 1}`;
-      params.push(beforeDate);
-    }
-
-    query += ` ORDER BY r.start_time ASC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
-    params.push(limit, offset);
-
-    const result = await pool.query(query, params);
+    // The RPC function returns all matching rides. Apply pagination and limit in Node.js
+    const paginatedRides = result.rows.slice((page - 1) * limit, page * limit);
+    const totalCount = result.rows.length; // Total count before pagination
 
     res.json({
-      rides: result.rows,
-      total: result.rows.length,
-      page,
-      limit,
+      rides: paginatedRides,
+      total: totalCount,
+      page: parseInt(page),
+      limit: parseInt(limit),
     });
   } catch (err) {
     console.error(err);
