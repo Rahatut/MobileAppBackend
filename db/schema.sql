@@ -301,6 +301,20 @@ CREATE TABLE Rating (
     CONSTRAINT fk_rating_rater FOREIGN KEY (rater_id) REFERENCES "User"(user_id) ON DELETE CASCADE,
     CONSTRAINT fk_rating_ratee FOREIGN KEY (ratee_id) REFERENCES "User"(user_id) ON DELETE CASCADE
 );
+--FEEDBACK
+CREATE TABLE feedback (
+    id SERIAL PRIMARY KEY,
+    ride_id INT NOT NULL,
+    reviewer_id INT NOT NULL,
+    reviewee_id INT NOT NULL,
+    rating INT NOT NULL CHECK (rating >= 1 AND rating <= 5),
+    review TEXT,
+    timestamp TIMESTAMP DEFAULT NOW(),
+    FOREIGN KEY (ride_id) REFERENCES rides(id),
+    FOREIGN KEY (reviewer_id) REFERENCES users(id),
+    FOREIGN KEY (reviewee_id) REFERENCES users(id)
+);
+
 
 -- =========================
 -- INDEXES

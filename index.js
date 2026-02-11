@@ -18,6 +18,7 @@ const paymentsRoutes = require('./routes/payments');
 const ratingsRoutes = require('./routes/ratings');
 const notificationsRoutes = require('./routes/notifications');
 const chatRoutes = require('./routes/chat');
+const feedbackRoutes = require('./routes/feedback');
 
 app.use('/api/auth', authRoutes);
 app.use('/api/users', usersRoutes);
@@ -28,6 +29,7 @@ app.use('/api/payments', paymentsRoutes);
 app.use('/api/ratings', ratingsRoutes);
 app.use('/api/notifications', notificationsRoutes);
 app.use('/api/chats', chatRoutes);
+app.use('/feedback', feedbackRoutes);
 
 // Health check
 app.get('/api/health', (req, res) => {
