@@ -493,11 +493,25 @@ router.post('/:rideId/complete', authMiddleware, async (req, res) => {
         [passenger.partner_id]
       );
 
-      // Create completion notification for passenger
+      // Create completion notification for passenger with action and ride info
       await client.query(
-        `INSERT INTO Notification (user_id, type, message, related_ride_id, related_user_id, is_read)
-         VALUES ($1, 'ride_completed', 'Your ride has been completed', $2, $3, false)`,
-        [passenger.partner_id, rideId, req.userId]
+        `INSERT INTO Notification (user_id, type, message, related_ride_id, related_user_id, is_read, action, ride_info)
+         VALUES ($1, 'ride_completed', $2, $3, $4, false, $5, $6)`,
+        [
+          passenger.partner_id,
+          'Your ride has been completed. Please rate your fellow passengers.',
+          rideId,
+          req.userId,
+          JSON.stringify({ type: 'open_buddy_feedback', rideId }),
+          JSON.stringify({
+            rideId,
+            fare: actualFare,
+            startTime: ride.start_time,
+            completionTime: completionTime || new Date(),
+            creatorId: ride.creator_id,
+            // Add more ride info as needed
+          })
+        ]
       );
     }
 

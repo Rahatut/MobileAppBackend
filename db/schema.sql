@@ -302,7 +302,8 @@ CREATE TABLE Rating (
     CONSTRAINT fk_rating_ratee FOREIGN KEY (ratee_id) REFERENCES "User"(user_id) ON DELETE CASCADE
 );
 --FEEDBACK
-CREATE TABLE feedback (
+
+CREATE TABLE IF NOT EXISTS feedback (
     id SERIAL PRIMARY KEY,
     ride_id INT NOT NULL,
     reviewer_id INT NOT NULL,
@@ -310,9 +311,9 @@ CREATE TABLE feedback (
     rating INT NOT NULL CHECK (rating >= 1 AND rating <= 5),
     review TEXT,
     timestamp TIMESTAMP DEFAULT NOW(),
-    FOREIGN KEY (ride_id) REFERENCES rides(id),
-    FOREIGN KEY (reviewer_id) REFERENCES users(id),
-    FOREIGN KEY (reviewee_id) REFERENCES users(id)
+    CONSTRAINT fk_feedback_ride FOREIGN KEY (ride_id) REFERENCES Ride(ride_id) ON DELETE CASCADE,
+    CONSTRAINT fk_feedback_reviewer FOREIGN KEY (reviewer_id) REFERENCES "User"(user_id) ON DELETE CASCADE,
+    CONSTRAINT fk_feedback_reviewee FOREIGN KEY (reviewee_id) REFERENCES "User"(user_id) ON DELETE CASCADE
 );
 
 
