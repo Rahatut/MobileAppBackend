@@ -36,6 +36,13 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'OK' });
 });
 
+
+// Catch-all 404 handler for debugging
+app.use((req, res, next) => {
+  console.warn(`404 Not Found: ${req.method} ${req.originalUrl}`);
+  res.status(404).json({ error: 'Not Found', method: req.method, url: req.originalUrl });
+});
+
 // Error handling middleware
 app.use((err, req, res, next) => {
   console.error(err.stack);

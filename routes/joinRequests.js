@@ -229,16 +229,22 @@ router.get('/ride/:rideId', authMiddleware, async (req, res) => {
 router.get('/my-requests', authMiddleware, async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT jr.*, r.ride_uuid,
+            `SELECT jr.*, r.ride_uuid, r.start_time, r.fare, r.transport_mode, r.ride_provider, r.available_seats, r.gender_preference, r.preference_notes, r.creator_id,
+              u.name as creator_name, u.username as creator_handle, u.user_id as creator_id,
               sl.name as start_name, sl.latitude as start_lat, sl.longitude as start_lng,
               dl.name as dest_name, dl.latitude as dest_lat, dl.longitude as dest_lng,
+              rsl.name as ride_start_name, rsl.latitude as ride_start_lat, rsl.longitude as ride_start_lng,
+              rdl.name as ride_dest_name, rdl.latitude as ride_dest_lat, rdl.longitude as ride_dest_lng,
               (SELECT status FROM Request_Status_Log WHERE request_id = jr.request_id ORDER BY timestamp DESC LIMIT 1) as current_status
-       FROM Join_Request jr
-       JOIN Ride r ON jr.ride_id = r.ride_id
-       LEFT JOIN Location_Info sl ON jr.start_location_id = sl.location_id
-       LEFT JOIN Location_Info dl ON jr.dest_location_id = dl.location_id
-       WHERE jr.partner_id = $1
-       ORDER BY jr.timestamp DESC`,
+             FROM Join_Request jr
+             JOIN Ride r ON jr.ride_id = r.ride_id
+             JOIN "User" u ON r.creator_id = u.user_id
+             LEFT JOIN Location_Info sl ON jr.start_location_id = sl.location_id
+             LEFT JOIN Location_Info dl ON jr.dest_location_id = dl.location_id
+             LEFT JOIN Location_Info rsl ON r.start_location_id = rsl.location_id
+             LEFT JOIN Location_Info rdl ON r.dest_location_id = rdl.location_id
+             WHERE jr.partner_id = $1
+             ORDER BY jr.timestamp DESC`,
       [req.userId]
     );
 
