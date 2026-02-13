@@ -1,3 +1,52 @@
+// Remove a passenger from a ride (creator only)
+router.delete('/:rideId/passenger/:passengerId', authMiddleware, async (req, res) => {
+  const { rideId, passengerId } = req.params;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    // Verify ride ownership
+    const rideResult = await client.query(
+      'SELECT creator_id FROM Ride WHERE ride_id = $1',
+      [rideId]
+    );
+    if (rideResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Ride not found' });
+    }
+    if (Number(rideResult.rows[0].creator_id) !== Number(req.userId)) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ error: 'Not authorized to remove passenger' });
+    }
+    // Find join request for this passenger and ride
+    const joinResult = await client.query(
+      'SELECT request_id FROM Join_Request WHERE ride_id = $1 AND partner_id = $2',
+      [rideId, passengerId]
+    );
+    if (joinResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Passenger not found in this ride' });
+    }
+    const requestId = joinResult.rows[0].request_id;
+    // Mark join request as removed
+    await client.query(
+      'INSERT INTO Request_Status_Log (request_id, status) VALUES ($1, $2)',
+      [requestId, 'removed']
+    );
+    // Increment available_seats for the ride
+    await client.query(
+      'UPDATE Ride SET available_seats = available_seats + 1 WHERE ride_id = $1',
+      [rideId]
+    );
+    await client.query('COMMIT');
+    return res.json({ message: 'Passenger removed from ride, seat is now available' });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error(err);
+    return res.status(500).json({ error: 'Failed to remove passenger' });
+  } finally {
+    client.release();
+  }
+});
 
 const express = require('express');
 const pool = require('../db/pool');
