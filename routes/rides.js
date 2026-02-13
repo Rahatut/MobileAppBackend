@@ -207,10 +207,24 @@ router.get('/', authMiddleware, async (req, res) => {
       startLocationLng,
       endLocationLat,
       endLocationLng,
-      radiusKm,
+      radiusKm = 5,
       page = 1,
       limit = 10
     } = req.query;
+
+    // Determine search type based on which coordinates are provided
+    let searchType = 'none';
+    
+    const hasStart = startLocationLat && startLocationLng;
+    const hasEnd = endLocationLat && endLocationLng;
+    
+    if (hasStart && hasEnd) {
+      searchType = 'both';
+    } else if (hasStart) {
+      searchType = 'start';
+    } else if (hasEnd) {
+      searchType = 'destination';
+    }
 
     const result = await pool.query(
       `SELECT * FROM get_available_rides_filtered(
@@ -218,36 +232,41 @@ router.get('/', authMiddleware, async (req, res) => {
         $3::double precision, $4::double precision,
         $5::double precision,
         $6::transport_mode_enum, $7::gender_enum,
-        $8::timestamp with time zone, $9::timestamp with time zone
+        $8::timestamp with time zone, $9::timestamp with time zone,
+        $10::text
       )`,
       [
         startLocationLat ? parseFloat(startLocationLat) : null,
         startLocationLng ? parseFloat(startLocationLng) : null,
         endLocationLat ? parseFloat(endLocationLat) : null,
         endLocationLng ? parseFloat(endLocationLng) : null,
-        radiusKm ? parseFloat(radiusKm) : null,
+        parseFloat(radiusKm),
         transportMode || null,
-        genderPreference || null,
+        genderPreference ? genderPreference.toLowerCase() : null,
         afterDate ? new Date(afterDate).toISOString() : null,
         beforeDate ? new Date(beforeDate).toISOString() : null,
+        searchType
       ]
     );
 
-    // The RPC function returns all matching rides. Apply pagination and limit in Node.js
+    // Apply pagination
     const paginatedRides = result.rows.slice((page - 1) * limit, page * limit);
-    const totalCount = result.rows.length; // Total count before pagination
+    const totalCount = result.rows.length;
 
     res.json({
       rides: paginatedRides,
       total: totalCount,
       page: parseInt(page),
       limit: parseInt(limit),
+      totalPages: Math.ceil(totalCount / limit),
+      searchType, // Include this so frontend knows what search was performed
     });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Failed to fetch rides' });
   }
 });
+
 
 // Get user's rides (as creator)
 router.get('/driver/my-rides', authMiddleware, async (req, res) => {

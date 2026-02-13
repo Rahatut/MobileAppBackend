@@ -785,6 +785,7 @@ EXECUTE FUNCTION validate_rating_participation();
 -- =========================
 -- FUNCTION: get_available_rides_filtered
 -- =========================
+
 CREATE OR REPLACE FUNCTION get_available_rides_filtered(
     p_start_lat double precision DEFAULT NULL,
     p_start_lng double precision DEFAULT NULL,
@@ -794,7 +795,8 @@ CREATE OR REPLACE FUNCTION get_available_rides_filtered(
     p_transport_mode transport_mode_enum DEFAULT NULL,
     p_gender_preference gender_enum DEFAULT NULL,
     p_after_date timestamptz DEFAULT NULL,
-    p_before_date timestamptz DEFAULT NULL
+    p_before_date timestamptz DEFAULT NULL,
+    p_search_type text DEFAULT 'none' -- 'none', 'start', 'destination', 'both'
 )
 RETURNS TABLE (
     ride_id integer,
@@ -839,15 +841,18 @@ AS $$
 DECLARE
     start_search_point geometry;
     end_search_point geometry;
+    search_radius_meters double precision;
 BEGIN
+    -- Convert radius to meters
+    search_radius_meters := p_radius_km * 1000;
+
+    -- Create geometry points for search coordinates
     IF p_start_lat IS NOT NULL AND p_start_lng IS NOT NULL THEN
-        start_search_point :=
-            ST_SetSRID(ST_MakePoint(p_start_lng, p_start_lat), 4326);
+        start_search_point := ST_SetSRID(ST_MakePoint(p_start_lng, p_start_lat), 4326);
     END IF;
 
     IF p_end_lat IS NOT NULL AND p_end_lng IS NOT NULL THEN
-        end_search_point :=
-            ST_SetSRID(ST_MakePoint(p_end_lng, p_end_lat), 4326);
+        end_search_point := ST_SetSRID(ST_MakePoint(p_end_lng, p_end_lat), 4326);
     END IF;
 
     RETURN QUERY
@@ -859,7 +864,6 @@ BEGIN
         r.status_log_id,
         r.ride_uuid,
         r.route_polyline,
-        -- convert to UTC if you want a timestamp without time zone:
         (r.created_at AT TIME ZONE 'UTC') AS created_at,
         (r.start_time AT TIME ZONE 'UTC') AS start_time,
         r.gender_preference,
@@ -895,17 +899,61 @@ BEGIN
     JOIN Location_Info ld ON ld.location_id = r.dest_location_id
     WHERE
         r.status = 'unactive'
-        AND (start_search_point IS NULL
-             OR ST_DWithin(ls.geom, start_search_point, p_radius_km * 1000))
-        AND (end_search_point IS NULL
-             OR ST_DWithin(ld.geom, end_search_point, p_radius_km * 1000))
+        AND (
+            -- Case 1: No location filtering
+            (p_search_type = 'none')
+            
+            OR
+            
+            -- Case 2: Search by start location only
+            (p_search_type = 'start' 
+             AND start_search_point IS NOT NULL 
+             AND ST_DWithin(ls.geom::geography, start_search_point::geography, search_radius_meters))
+            
+            OR
+            
+            -- Case 3: Search by destination location only
+            (p_search_type = 'destination' 
+             AND end_search_point IS NOT NULL 
+             AND ST_DWithin(ld.geom::geography, end_search_point::geography, search_radius_meters))
+            
+            OR
+            
+            -- Case 4: Search by both locations - find rides along the route
+            -- Uses straight-line approximation between ride's start and end points
+            (p_search_type = 'both' 
+             AND start_search_point IS NOT NULL 
+             AND end_search_point IS NOT NULL
+             AND (
+                 -- Check if user's start point is within radius of ride start
+                 ST_DWithin(ls.geom::geography, start_search_point::geography, search_radius_meters)
+                 AND 
+                 -- Check if user's end point is within radius of ride end
+                 ST_DWithin(ld.geom::geography, end_search_point::geography, search_radius_meters)
+                 
+                 OR
+                 
+                 -- Alternative: Check if both user points are near the straight-line route
+                 -- This allows matching rides that go in the same direction
+                 (ST_DWithin(
+                      ST_MakeLine(ls.geom, ld.geom)::geography,
+                      start_search_point::geography,
+                      search_radius_meters
+                  )
+                  AND ST_DWithin(
+                      ST_MakeLine(ls.geom, ld.geom)::geography,
+                      end_search_point::geography,
+                      search_radius_meters
+                  ))
+             ))
+        )
+        -- Additional filters
         AND (p_transport_mode IS NULL OR r.transport_mode = p_transport_mode)
         AND (p_gender_preference IS NULL OR r.gender_preference = p_gender_preference)
         AND (p_after_date IS NULL OR r.start_time >= p_after_date)
         AND (p_before_date IS NULL OR r.start_time <= p_before_date);
 END;
 $$;
-
 
 -- ============================
 -- HELPFUL VIEWS
