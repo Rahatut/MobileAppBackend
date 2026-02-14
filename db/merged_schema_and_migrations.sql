@@ -787,6 +787,7 @@ EXECUTE FUNCTION validate_rating_participation();
 -- =========================
 
 CREATE OR REPLACE FUNCTION get_available_rides_filtered(
+    p_user_id integer DEFAULT NULL, 
     p_start_lat double precision DEFAULT NULL,
     p_start_lng double precision DEFAULT NULL,
     p_end_lat double precision DEFAULT NULL,
@@ -796,7 +797,7 @@ CREATE OR REPLACE FUNCTION get_available_rides_filtered(
     p_gender_preference gender_enum DEFAULT NULL,
     p_after_date timestamptz DEFAULT NULL,
     p_before_date timestamptz DEFAULT NULL,
-    p_search_type text DEFAULT 'none' -- 'none', 'start', 'destination', 'both'
+    p_search_type text DEFAULT 'none' 
 )
 RETURNS TABLE (
     ride_id integer,
@@ -842,6 +843,8 @@ DECLARE
     start_search_point geometry;
     end_search_point geometry;
     search_radius_meters double precision;
+    route_geom geometry;
+    is_valid_geojson boolean;
 BEGIN
     -- Convert radius to meters
     search_radius_meters := p_radius_km * 1000;
@@ -872,7 +875,7 @@ BEGIN
         r.ride_provider,
         r.fare,
         r.available_seats,
-        r.status::text,
+        r.status::text,  
         r.actual_fare,
         (r.completion_time AT TIME ZONE 'UTC') AS completion_time,
         r.trip_duration_minutes,
@@ -898,7 +901,13 @@ BEGIN
     JOIN Location_Info ls ON ls.location_id = r.start_location_id
     JOIN Location_Info ld ON ld.location_id = r.dest_location_id
     WHERE
-        r.status = 'unactive'
+        -- Exclude user's own rides
+        (p_user_id IS NULL OR r.creator_id != p_user_id)
+        
+        -- Filter by ride status
+        AND r.status = 'unactive'
+        
+        -- Location filtering
         AND (
             -- Case 1: No location filtering
             (p_search_type = 'none')
@@ -919,22 +928,21 @@ BEGIN
             
             OR
             
-            -- Case 4: Search by both locations - find rides along the route
-            -- Uses straight-line approximation between ride's start and end points
+            -- Case 4: Search by both locations
             (p_search_type = 'both' 
              AND start_search_point IS NOT NULL 
              AND end_search_point IS NOT NULL
              AND (
-                 -- Check if user's start point is within radius of ride start
-                 ST_DWithin(ls.geom::geography, start_search_point::geography, search_radius_meters)
-                 AND 
-                 -- Check if user's end point is within radius of ride end
-                 ST_DWithin(ld.geom::geography, end_search_point::geography, search_radius_meters)
+                 -- SIMPLIFIED APPROACH: Use straight line matching
+                 -- This avoids GeoJSON parsing errors entirely
+                 
+                 -- Option 1: Both points close to ride start/end
+                 (ST_DWithin(ls.geom::geography, start_search_point::geography, search_radius_meters)
+                  AND ST_DWithin(ld.geom::geography, end_search_point::geography, search_radius_meters))
                  
                  OR
                  
-                 -- Alternative: Check if both user points are near the straight-line route
-                 -- This allows matching rides that go in the same direction
+                 -- Option 2: Both points near the straight-line route with direction check
                  (ST_DWithin(
                       ST_MakeLine(ls.geom, ld.geom)::geography,
                       start_search_point::geography,
@@ -944,6 +952,14 @@ BEGIN
                       ST_MakeLine(ls.geom, ld.geom)::geography,
                       end_search_point::geography,
                       search_radius_meters
+                  )
+                  -- Direction check: user start must come before user end
+                  AND ST_LineLocatePoint(
+                      ST_MakeLine(ls.geom, ld.geom),
+                      ST_ClosestPoint(ST_MakeLine(ls.geom, ld.geom), start_search_point)
+                  ) < ST_LineLocatePoint(
+                      ST_MakeLine(ls.geom, ld.geom),
+                      ST_ClosestPoint(ST_MakeLine(ls.geom, ld.geom), end_search_point)
                   ))
              ))
         )
@@ -951,7 +967,8 @@ BEGIN
         AND (p_transport_mode IS NULL OR r.transport_mode = p_transport_mode)
         AND (p_gender_preference IS NULL OR r.gender_preference = p_gender_preference)
         AND (p_after_date IS NULL OR r.start_time >= p_after_date)
-        AND (p_before_date IS NULL OR r.start_time <= p_before_date);
+        AND (p_before_date IS NULL OR r.start_time <= p_before_date)
+    ORDER BY r.start_time DESC;
 END;
 $$;
 

@@ -9,40 +9,67 @@ const router = express.Router();
 router.post('/:rideId/join', authMiddleware, async (req, res) => {
   const client = await pool.connect();
   try {
-    const { startLocation, destLocation } = req.body;
+    let { startLocation, destLocation } = req.body;
     const rideId = req.params.rideId;
     const partnerId = req.userId;
 
-    if (!startLocation || !destLocation) {
-      return res.status(400).json({ error: 'Missing pickup/dropoff location' });
-    }
-
     await client.query('BEGIN');
 
-    // Insert or get pickup location
-    const startLocationId = await getOrCreateLocation(
-      client,
-      startLocation.name || startLocation.address,
-      startLocation.address,
-      startLocation.latitude,
-      startLocation.longitude
+    // Fetch original ride's start and destination locations
+    const rideDetailsResult = await client.query(
+      `SELECT start_location_id, dest_location_id
+       FROM Ride WHERE ride_id = $1`,
+      [rideId]
     );
 
-    // Insert or get dropoff location
-    const destLocationId = await getOrCreateLocation(
-      client,
-      destLocation.name || destLocation.address,
-      destLocation.address,
-      destLocation.latitude,
-      destLocation.longitude
-    );
+    if (rideDetailsResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Ride not found' });
+    }
+
+    const originalRide = rideDetailsResult.rows[0];
+
+    let finalStartLocationId;
+    let finalDestLocationId;
+
+    // Resolve start location
+    if (startLocation && startLocation.latitude && startLocation.longitude) {
+      finalStartLocationId = await getOrCreateLocation(
+        client,
+        startLocation.name || startLocation.address,
+        startLocation.address,
+        startLocation.latitude,
+        startLocation.longitude
+      );
+    } else {
+      finalStartLocationId = originalRide.start_location_id;
+    }
+
+    // Resolve destination location
+    if (destLocation && destLocation.latitude && destLocation.longitude) {
+      finalDestLocationId = await getOrCreateLocation(
+        client,
+        destLocation.name || destLocation.address,
+        destLocation.address,
+        destLocation.latitude,
+        destLocation.longitude
+      );
+    } else {
+      finalDestLocationId = originalRide.dest_location_id;
+    }
+
+    // Ensure we have valid location IDs before proceeding
+    if (!finalStartLocationId || !finalDestLocationId) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Could not determine valid start or destination location for join request.' });
+    }
 
     // Create join request
     const joinResult = await client.query(
       `INSERT INTO Join_Request (ride_id, partner_id, start_location_id, dest_location_id, status_id)
        VALUES ($1, $2, $3, $4, NULL)
        RETURNING request_id`,
-      [rideId, partnerId, startLocationId, destLocationId]
+      [rideId, partnerId, finalStartLocationId, finalDestLocationId]
     );
 
     // Add initial status log
@@ -81,12 +108,18 @@ async function getOrCreateLocation(client, name, address, latitude, longitude) {
   return insertResult.rows[0].location_id;
 }
 
-// Helper function to add ride status
+// Helper function to add ride status and update the ride's status_log_id and status
 async function addRideStatus(client, rideId, status) {
-  await client.query(
-    'INSERT INTO Ride_Status_Log (ride_id, status) VALUES ($1, $2)',
+  const logResult = await client.query(
+    'INSERT INTO Ride_Status_Log (ride_id, status) VALUES ($1, $2) RETURNING log_id',
     [rideId, status]
   );
+  const logId = logResult.rows[0].log_id;
+  await client.query(
+    'UPDATE Ride SET status_log_id = $1, status = $2 WHERE ride_id = $3',
+    [logId, status, rideId]
+  );
+  return logId;
 }
 
 // Helper function to get current ride status
@@ -159,7 +192,7 @@ router.post('/', authMiddleware, async (req, res) => {
         fare,
         genderPreference,
         notes,
-        routePolyline,
+        routePolyline ? JSON.stringify(routePolyline) : null,
       ]
     );
 
@@ -207,9 +240,7 @@ router.get('/', authMiddleware, async (req, res) => {
       startLocationLng,
       endLocationLat,
       endLocationLng,
-      radiusKm = 5,
-      page = 1,
-      limit = 10
+      radiusKm = 5
     } = req.query;
 
     // Determine search type based on which coordinates are provided
@@ -228,14 +259,16 @@ router.get('/', authMiddleware, async (req, res) => {
 
     const result = await pool.query(
       `SELECT * FROM get_available_rides_filtered(
-        $1::double precision, $2::double precision,
-        $3::double precision, $4::double precision,
-        $5::double precision,
-        $6::transport_mode_enum, $7::gender_enum,
-        $8::timestamp with time zone, $9::timestamp with time zone,
-        $10::text
+        $1::integer, 
+        $2::double precision, $3::double precision,
+        $4::double precision, $5::double precision,
+        $6::double precision,
+        $7::transport_mode_enum, $8::gender_enum,
+        $9::timestamp with time zone, $10::timestamp with time zone,
+        $11::text
       )`,
       [
+        req.userId, 
         startLocationLat ? parseFloat(startLocationLat) : null,
         startLocationLng ? parseFloat(startLocationLng) : null,
         endLocationLat ? parseFloat(endLocationLat) : null,
@@ -249,16 +282,9 @@ router.get('/', authMiddleware, async (req, res) => {
       ]
     );
 
-    // Apply pagination
-    const paginatedRides = result.rows.slice((page - 1) * limit, page * limit);
-    const totalCount = result.rows.length;
-
     res.json({
-      rides: paginatedRides,
-      total: totalCount,
-      page: parseInt(page),
-      limit: parseInt(limit),
-      totalPages: Math.ceil(totalCount / limit),
+      rides: result.rows,
+      total: result.rows.length,
       searchType, // Include this so frontend knows what search was performed
     });
   } catch (err) {
@@ -459,8 +485,7 @@ router.post('/:rideId/complete', authMiddleware, async (req, res) => {
     // Update ride with completion details
     const updateResult = await client.query(
       `UPDATE Ride 
-       SET status = 'completed',
-           actual_fare = $1,
+       SET actual_fare = $1,
            completion_time = $2,
            trip_duration_minutes = $3,
            updated_at = CURRENT_TIMESTAMP
