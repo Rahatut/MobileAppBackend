@@ -1,3 +1,7 @@
+// Simple GET endpoint for /payments
+router.get('/', (req, res) => {
+  res.json({ status: 'Payments endpoint is reachable.' });
+});
 const express = require('express');
 const pool = require('../db/pool');
 const authMiddleware = require('../middleware/auth');

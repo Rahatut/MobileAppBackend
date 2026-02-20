@@ -1,3 +1,7 @@
+// Simple GET endpoint for /join-requests
+router.get('/', (req, res) => {
+  res.json({ status: 'JoinRequests endpoint is reachable.' });
+});
 const express = require('express');
 const pool = require('../db/pool');
 const authMiddleware = require('../middleware/auth');
