@@ -1,3 +1,9 @@
+const express = require('express');
+const pool = require('../db/pool');
+const authMiddleware = require('../middleware/auth');
+
+const router = express.Router();
+
 // Remove a passenger from a ride (creator only)
 router.delete('/:rideId/passenger/:passengerId', authMiddleware, async (req, res) => {
   const { rideId, passengerId } = req.params;
