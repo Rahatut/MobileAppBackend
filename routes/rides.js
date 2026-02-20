@@ -1,4 +1,5 @@
 const express = require('express');
+// ...existing code...
 const pool = require('../db/pool');
 const authMiddleware = require('../middleware/auth');
 
@@ -54,11 +55,7 @@ router.delete('/:rideId/passenger/:passengerId', authMiddleware, async (req, res
   }
 });
 
-const express = require('express');
-const pool = require('../db/pool');
-const authMiddleware = require('../middleware/auth');
-
-const router = express.Router();
+// ...existing code...
 
 // Request to join a ride with custom pickup/dropoff
 router.post('/:rideId/join', authMiddleware, async (req, res) => {
