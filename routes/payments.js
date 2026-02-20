@@ -1,12 +1,13 @@
-// Simple GET endpoint for /payments
-router.get('/', (req, res) => {
-  res.json({ status: 'Payments endpoint is reachable.' });
-});
 const express = require('express');
 const pool = require('../db/pool');
 const authMiddleware = require('../middleware/auth');
 
 const router = express.Router();
+
+// Simple GET endpoint for /payments (must be after router is defined)
+router.get('/', (req, res) => {
+  res.json({ status: 'Payments endpoint is reachable.' });
+});
 
 // Helper function to add payment status
 async function addPaymentStatus(client, paymentId, status) {

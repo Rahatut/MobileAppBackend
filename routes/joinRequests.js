@@ -1,12 +1,13 @@
-// Simple GET endpoint for /join-requests
-router.get('/', (req, res) => {
-  res.json({ status: 'JoinRequests endpoint is reachable.' });
-});
 const express = require('express');
 const pool = require('../db/pool');
 const authMiddleware = require('../middleware/auth');
 
 const router = express.Router();
+
+// Simple GET endpoint for /join-requests (must be after router is defined)
+router.get('/', (req, res) => {
+  res.json({ status: 'JoinRequests endpoint is reachable.' });
+});
 
 // Helper function to add request status
 async function addRequestStatus(client, requestId, status) {

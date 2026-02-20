@@ -1,13 +1,14 @@
-// Simple GET endpoint for /auth
-router.get('/', (req, res) => {
-  res.json({ status: 'Auth endpoint is reachable.' });
-});
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const pool = require('../db/pool');
 
 const router = express.Router();
+
+// Simple GET endpoint for /auth (must be after router is defined)
+router.get('/', (req, res) => {
+  res.json({ status: 'Auth endpoint is reachable.' });
+});
 
 // Register
 router.post('/register', async (req, res) => {
