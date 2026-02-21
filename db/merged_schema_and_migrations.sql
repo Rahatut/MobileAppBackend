@@ -199,6 +199,7 @@ CREATE TABLE Join_Request (
     status_id INT,
     request_uuid UUID UNIQUE DEFAULT uuid_generate_v4(),
     route_polyline TEXT,
+    status request_status_enum DEFAULT 'pending',
     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 
     CONSTRAINT fk_jr_ride FOREIGN KEY (ride_id) REFERENCES Ride(ride_id) ON DELETE CASCADE,
@@ -1026,9 +1027,14 @@ FROM "User" u;
 -- =========================
 -- MIGRATION: 005_fix_missing_geom.sql
 -- =========================
--- Date: 2026-02-21
--- Description: Backfill geom data for any newly inserted locations
 
 UPDATE Location_Info
 SET geom = ST_SetSRID(ST_MakePoint(longitude, latitude), 4326)
 WHERE geom IS NULL AND latitude IS NOT NULL AND longitude IS NOT NULL;
+
+-- =========================
+-- MIGRATION: 006_add_status_to_join_request.sql
+-- =========================
+
+ALTER TABLE Join_Request
+ADD COLUMN IF NOT EXISTS status request_status_enum DEFAULT 'pending';

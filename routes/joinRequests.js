@@ -10,17 +10,29 @@ async function addRequestStatus(client, requestId, status) {
     'INSERT INTO Request_Status_Log (request_id, status) VALUES ($1, $2)',
     [requestId, status]
   );
+  await client.query(
+    'UPDATE Join_Request SET status = $1 WHERE request_id = $2',
+    [status, requestId]
+  );
 }
 
 // Helper function to get current request status
 async function getCurrentRequestStatus(client, requestId) {
   const result = await client.query(
+    `SELECT status FROM Join_Request WHERE request_id = $1`,
+    [requestId]
+  );
+  if (result.rows.length > 0 && result.rows[0].status) {
+    return result.rows[0].status;
+  }
+  // Fallback to log
+  const logResult = await client.query(
     `SELECT status FROM Request_Status_Log 
      WHERE request_id = $1 
      ORDER BY timestamp DESC LIMIT 1`,
     [requestId]
   );
-  return result.rows.length > 0 ? result.rows[0].status : null;
+  return logResult.rows.length > 0 ? logResult.rows[0].status : null;
 }
 
 // Helper function to get or create location
@@ -82,7 +94,7 @@ router.post('/', authMiddleware, async (req, res) => {
 
     // Check ride exists and has available seats
     const rideResult = await client.query(
-      'SELECT available_seats, fare, creator_id FROM Ride WHERE ride_id = $1',
+      'SELECT available_seats, fare, creator_id, start_location_id, dest_location_id, route_polyline FROM Ride WHERE ride_id = $1',
       [rideId]
     );
 
@@ -103,8 +115,8 @@ router.post('/', authMiddleware, async (req, res) => {
     }
 
     // Create locations if provided
-    let startLocationId = null;
-    let destLocationId = null;
+    let startLocationId = rideResult.rows[0].start_location_id;
+    let destLocationId = rideResult.rows[0].dest_location_id;
 
     if (startLocation) {
       startLocationId = await getOrCreateLocation(
@@ -124,27 +136,33 @@ router.post('/', authMiddleware, async (req, res) => {
       );
     }
 
+    let parsedRoutePolyline = null;
+    if (routePolyline) {
+      let parsed = typeof routePolyline === 'string' ? JSON.parse(routePolyline) : routePolyline;
+      if (parsed && parsed.coordinates) {
+         parsedRoutePolyline = JSON.stringify({
+           type: 'LineString',
+           coordinates: parsed.coordinates
+         });
+      } else {
+         parsedRoutePolyline = JSON.stringify(parsed);
+      }
+    } else {
+      parsedRoutePolyline = rideResult.rows[0].route_polyline;
+    }
+
     // Insert join request
     const result = await client.query(
-      `INSERT INTO Join_Request (ride_id, partner_id, start_location_id, dest_location_id, route_polyline) 
-       VALUES ($1, $2, $3, $4, $5) 
+      `INSERT INTO Join_Request (ride_id, partner_id, start_location_id, dest_location_id, route_polyline, status) 
+       VALUES ($1, $2, $3, $4, $5, $6) 
        RETURNING *`,
       [
         rideId, 
         req.userId, 
         startLocationId, 
         destLocationId, 
-        (() => {
-          if (!routePolyline) return null;
-          let parsed = typeof routePolyline === 'string' ? JSON.parse(routePolyline) : routePolyline;
-          if (parsed && parsed.coordinates) {
-             return JSON.stringify({
-               type: 'LineString',
-               coordinates: parsed.coordinates
-             });
-          }
-          return JSON.stringify(parsed);
-        })()
+        parsedRoutePolyline,
+        'pending'
       ]
     );
 
@@ -311,7 +329,7 @@ router.get('/:id', authMiddleware, async (req, res) => {
               (SELECT status FROM Request_Status_Log WHERE request_id = jr.request_id ORDER BY timestamp DESC LIMIT 1) as status
        FROM Join_Request jr
        LEFT JOIN Location_Info li1 ON jr.start_location_id = li1.location_id
-       LEFT JOIN Location_Info li2 ON jr.end_location_id = li2.location_id
+       LEFT JOIN Location_Info li2 ON jr.dest_location_id = li2.location_id
        WHERE jr.request_id = $1`,
       [req.params.id]
     );
