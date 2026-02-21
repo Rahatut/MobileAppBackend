@@ -1,4 +1,3 @@
-
 const express = require('express');
 const pool = require('../db/pool');
 const authMiddleware = require('../middleware/auth');
@@ -101,7 +100,7 @@ async function getOrCreateLocation(client, name, address, latitude, longitude) {
   }
 
   const insertResult = await client.query(
-    'INSERT INTO Location_Info (name, address, latitude, longitude) VALUES ($1, $2, $3, $4) RETURNING location_id',
+    'INSERT INTO Location_Info (name, address, latitude, longitude, geom) VALUES ($1, $2, $3::numeric, $4::numeric, ST_SetSRID(ST_MakePoint($4::double precision, $3::double precision), 4326)) RETURNING location_id',
     [name, address, latitude, longitude]
   );
 
@@ -192,7 +191,19 @@ router.post('/', authMiddleware, async (req, res) => {
         fare,
         genderPreference,
         notes,
-        routePolyline ? JSON.stringify(routePolyline) : null,
+        (() => {
+          if (!routePolyline) return null;
+          let parsed = typeof routePolyline === 'string' ? JSON.parse(routePolyline) : routePolyline;
+          
+          // Enforce GeoJSON LineString format exactly as converted by convert-polylines.js
+          if (parsed && parsed.coordinates) {
+             return JSON.stringify({
+               type: 'LineString',
+               coordinates: parsed.coordinates
+             });
+          }
+          return JSON.stringify(parsed);
+        })(),
       ]
     );
 

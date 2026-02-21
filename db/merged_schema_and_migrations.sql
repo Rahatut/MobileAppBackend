@@ -1022,3 +1022,13 @@ FROM "User" u;
 
 -- To see function source code:
 -- SELECT pg_get_functiondef(oid) FROM pg_proc WHERE proname = 'function_name';
+
+-- =========================
+-- MIGRATION: 005_fix_missing_geom.sql
+-- =========================
+-- Date: 2026-02-21
+-- Description: Backfill geom data for any newly inserted locations
+
+UPDATE Location_Info
+SET geom = ST_SetSRID(ST_MakePoint(longitude, latitude), 4326)
+WHERE geom IS NULL AND latitude IS NOT NULL AND longitude IS NOT NULL;

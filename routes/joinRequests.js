@@ -35,7 +35,7 @@ async function getOrCreateLocation(client, name, latitude, longitude) {
   }
 
   const insertResult = await client.query(
-    'INSERT INTO Location_Info (name, address, latitude, longitude) VALUES ($1, $2, $3, $4) RETURNING location_id',
+    'INSERT INTO Location_Info (name, address, latitude, longitude, geom) VALUES ($1, $2, $3::numeric, $4::numeric, ST_SetSRID(ST_MakePoint($4::double precision, $3::double precision), 4326)) RETURNING location_id',
     [name, name, latitude, longitude]
   );
 
@@ -65,14 +65,18 @@ router.post('/', authMiddleware, async (req, res) => {
     );
 
     if (existingRequest.rows.length > 0) {
-      await client.query('ROLLBACK');
       const status = existingRequest.rows[0].status;
       if (status === 'accepted') {
+        await client.query('ROLLBACK');
         return res.status(400).json({ error: 'You have already joined this ride' });
       } else if (status === 'pending') {
+        await client.query('ROLLBACK');
         return res.status(400).json({ error: 'You have already requested to join this ride' });
       } else if (status === 'rejected') {
+        await client.query('ROLLBACK');
         return res.status(400).json({ error: 'Your previous request was declined' });
+      } else if (status === 'cancelled') {
+        // User cancelled, so allow them to request again.
       }
     }
 
@@ -125,7 +129,23 @@ router.post('/', authMiddleware, async (req, res) => {
       `INSERT INTO Join_Request (ride_id, partner_id, start_location_id, dest_location_id, route_polyline) 
        VALUES ($1, $2, $3, $4, $5) 
        RETURNING *`,
-      [rideId, req.userId, startLocationId, destLocationId, routePolyline]
+      [
+        rideId, 
+        req.userId, 
+        startLocationId, 
+        destLocationId, 
+        (() => {
+          if (!routePolyline) return null;
+          let parsed = typeof routePolyline === 'string' ? JSON.parse(routePolyline) : routePolyline;
+          if (parsed && parsed.coordinates) {
+             return JSON.stringify({
+               type: 'LineString',
+               coordinates: parsed.coordinates
+             });
+          }
+          return JSON.stringify(parsed);
+        })()
+      ]
     );
 
     const joinRequest = result.rows[0];
