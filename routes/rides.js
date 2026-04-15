@@ -471,6 +471,65 @@ router.get('/:identifier', async (req, res) => {
   }
 });
 
+// Edit ride details (creator only)
+router.put('/:rideId', authMiddleware, async (req, res) => {
+  const { rideId } = req.params;
+  const { fare, transportMode, rideProvider, genderPreference, availableSeats, notes } = req.body;
+  const client = await pool.connect();
+
+  try {
+    await client.query('BEGIN');
+
+    // Verify ownership
+    const rideResult = await client.query(
+      'SELECT creator_id FROM Ride WHERE ride_id = $1',
+      [rideId]
+    );
+
+    if (rideResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Ride not found' });
+    }
+
+    if (Number(rideResult.rows[0].creator_id) !== Number(req.userId)) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ error: 'Not authorized to edit this ride' });
+    }
+
+    const updateResult = await client.query(
+      `UPDATE Ride
+       SET fare               = COALESCE($1, fare),
+           transport_mode     = COALESCE($2, transport_mode),
+           ride_provider      = COALESCE($3, ride_provider),
+           gender_preference  = COALESCE($4, gender_preference),
+           available_seats    = COALESCE($5, available_seats),
+           preference_notes   = COALESCE($6, preference_notes),
+           updated_at         = CURRENT_TIMESTAMP
+       WHERE ride_id = $7
+       RETURNING *`,
+      [
+        fare !== undefined ? parseFloat(fare) : null,
+        transportMode || null,
+        rideProvider || null,
+        genderPreference || null,
+        availableSeats !== undefined ? parseInt(availableSeats) : null,
+        notes !== undefined ? notes : null,
+        rideId,
+      ]
+    );
+
+    await client.query('COMMIT');
+
+    return res.json({ message: 'Ride updated', ride: updateResult.rows[0] });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error(err);
+    return res.status(500).json({ error: 'Failed to update ride' });
+  } finally {
+    client.release();
+  }
+});
+
 // Update ride status
 router.patch('/:rideId/status', authMiddleware, async (req, res) => {
   const client = await pool.connect();
