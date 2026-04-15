@@ -74,7 +74,7 @@ router.post('/request', authMiddleware, async (req, res) => {
     const notifMessage = `${senderName} sent you a friend request.`;
     await client.query(
       `INSERT INTO Notification (user_id, type, message, related_user_id, related_request_id) VALUES ($1, $2, $3, $4, $5)`,
-      [receiverId, 'friend_request', notifMessage, req.userId, null]
+      [receiverId, 'friend_request', notifMessage, req.userId, friendRequest.request_id]
     );
     await client.query('COMMIT');
     res.status(201).json({ message: 'Friend request sent', friendRequest });
