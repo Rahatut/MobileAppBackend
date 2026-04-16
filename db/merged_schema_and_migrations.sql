@@ -795,7 +795,7 @@ CREATE OR REPLACE FUNCTION get_available_rides_filtered(
     p_end_lng double precision DEFAULT NULL,
     p_radius_km double precision DEFAULT 5,
     p_transport_mode transport_mode_enum DEFAULT NULL,
-    p_gender_preference gender_enum DEFAULT NULL,
+  p_gender_preference text DEFAULT NULL,
     p_after_date timestamptz DEFAULT NULL,
     p_before_date timestamptz DEFAULT NULL,
     p_search_type text DEFAULT 'none' 
@@ -810,7 +810,7 @@ RETURNS TABLE (
     route_polyline text,
     created_at timestamptz,
     start_time timestamptz,
-    gender_preference gender_enum,
+    gender_preference text,
     preference_notes text,
     transport_mode transport_mode_enum,
     ride_provider ride_provider_enum,
@@ -870,7 +870,7 @@ BEGIN
         r.route_polyline,
         (r.created_at AT TIME ZONE 'UTC') AS created_at,
         (r.start_time AT TIME ZONE 'UTC') AS start_time,
-        r.gender_preference,
+        r.gender_preference::text,
         r.preference_notes::text,
         r.transport_mode,
         r.ride_provider,
@@ -966,7 +966,7 @@ BEGIN
         )
         -- Additional filters
         AND (p_transport_mode IS NULL OR r.transport_mode = p_transport_mode)
-        AND (p_gender_preference IS NULL OR r.gender_preference = p_gender_preference)
+        AND (p_gender_preference IS NULL OR r.gender_preference::text = p_gender_preference)
         AND (p_after_date IS NULL OR r.start_time >= p_after_date)
         AND (p_before_date IS NULL OR r.start_time <= p_before_date)
     ORDER BY r.start_time DESC;

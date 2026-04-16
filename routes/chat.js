@@ -4,27 +4,165 @@ const authMiddleware = require('../middleware/auth');
 
 const router = express.Router();
 
+async function getChatMeta(client, chatId) {
+  const result = await client.query('SELECT chat_id, type, ride_id FROM Chat WHERE chat_id = $1', [chatId]);
+  return result.rows[0] || null;
+}
+
+async function isRideGroupMember(client, rideId, userId) {
+  const result = await client.query(
+    `SELECT 1
+     FROM Ride r
+     WHERE r.ride_id = $1
+       AND (
+         r.creator_id = $2
+         OR EXISTS (
+           SELECT 1
+           FROM Join_Request jr
+           WHERE jr.ride_id = r.ride_id
+             AND jr.partner_id = $2
+             AND COALESCE(
+               (SELECT status FROM Request_Status_Log WHERE request_id = jr.request_id ORDER BY timestamp DESC LIMIT 1),
+               jr.status
+             ) = 'accepted'
+         )
+       )
+     LIMIT 1`,
+    [rideId, userId]
+  );
+  return result.rows.length > 0;
+}
+
+async function canUsersDirectMessage(client, userA, userB) {
+  const result = await client.query(
+    `SELECT 1
+     WHERE EXISTS (
+       SELECT 1
+       FROM Ride r
+       WHERE r.creator_id IN ($1, $2)
+         AND (
+           EXISTS (
+             SELECT 1 FROM Join_Request j1
+             WHERE j1.ride_id = r.ride_id
+               AND j1.partner_id = $1
+               AND COALESCE(
+                 (SELECT status FROM Request_Status_Log WHERE request_id = j1.request_id ORDER BY timestamp DESC LIMIT 1),
+                 j1.status
+               ) IN ('accepted', 'pending')
+           )
+           OR EXISTS (
+             SELECT 1 FROM Join_Request j2
+             WHERE j2.ride_id = r.ride_id
+               AND j2.partner_id = $2
+               AND COALESCE(
+                 (SELECT status FROM Request_Status_Log WHERE request_id = j2.request_id ORDER BY timestamp DESC LIMIT 1),
+                 j2.status
+               ) IN ('accepted', 'pending')
+           )
+         )
+     )
+     OR EXISTS (
+       SELECT 1
+       FROM Join_Request a
+       JOIN Join_Request b ON a.ride_id = b.ride_id
+       WHERE a.partner_id = $1
+         AND b.partner_id = $2
+         AND COALESCE(
+           (SELECT status FROM Request_Status_Log WHERE request_id = a.request_id ORDER BY timestamp DESC LIMIT 1),
+           a.status
+         ) = 'accepted'
+         AND COALESCE(
+           (SELECT status FROM Request_Status_Log WHERE request_id = b.request_id ORDER BY timestamp DESC LIMIT 1),
+           b.status
+         ) = 'accepted'
+     )`,
+    [userA, userB]
+  );
+
+  return result.rows.length > 0;
+}
+
+async function isAuthorizedForChat(client, chatId, userId) {
+  const chat = await getChatMeta(client, chatId);
+  if (!chat) {
+    return { ok: false, reason: 'Chat not found', status: 404 };
+  }
+
+  // For ride chats, enforce dynamic membership based on ride/join status.
+  if (chat.type === 'ride' && chat.ride_id) {
+    const member = await isRideGroupMember(client, chat.ride_id, userId);
+    if (!member) {
+      return { ok: false, reason: 'Not authorized for this ride chat', status: 403 };
+    }
+    return { ok: true, chat };
+  }
+
+  // For private chats, require Chat_Participants membership.
+  const participantCheck = await client.query(
+    'SELECT 1 FROM Chat_Participants WHERE chat_id = $1 AND participant_id = $2',
+    [chatId, userId]
+  );
+
+  if (participantCheck.rows.length === 0) {
+    return { ok: false, reason: 'Not authorized', status: 403 };
+  }
+
+  return { ok: true, chat };
+}
+
 // Get all chats for current user
 router.get('/', authMiddleware, async (req, res) => {
   try {
-    const { page = 1, limit = 20 } = req.query;
+    const { page = 1, limit = 20, type } = req.query;
     const offset = (page - 1) * limit;
 
+    const typeFilter = type === 'ride' || type === 'private' ? type : null;
+
     const result = await pool.query(
-      `SELECT DISTINCT c.*, 
+      `SELECT DISTINCT c.*,
+              r.ride_id,
+              sl.name as ride_start_name,
+              dl.name as ride_dest_name,
               (SELECT content FROM Message WHERE chat_id = c.chat_id ORDER BY created_at DESC LIMIT 1) as last_message,
               (SELECT to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
                FROM Message WHERE chat_id = c.chat_id ORDER BY created_at DESC LIMIT 1) as last_message_time,
               (SELECT COUNT(*) FROM Message WHERE chat_id = c.chat_id AND is_read = false AND sender_id != $1) as unread_count
        FROM Chat c
+       LEFT JOIN Ride r ON c.ride_id = r.ride_id
+       LEFT JOIN Location_Info sl ON r.start_location_id = sl.location_id
+       LEFT JOIN Location_Info dl ON r.dest_location_id = dl.location_id
        JOIN Chat_Participants cp ON c.chat_id = cp.chat_id
        WHERE cp.participant_id = $1
+         AND ($2::text IS NULL OR c.type = $2::chat_type_enum)
+         AND (
+            c.type != 'ride'
+            OR c.ride_id IS NULL
+            OR r.creator_id = $1
+            OR EXISTS (
+              SELECT 1
+              FROM Join_Request jr
+              WHERE jr.ride_id = c.ride_id
+                AND jr.partner_id = $1
+                AND COALESCE(
+                  (SELECT status FROM Request_Status_Log WHERE request_id = jr.request_id ORDER BY timestamp DESC LIMIT 1),
+                  jr.status
+                ) = 'accepted'
+            )
+         )
        ORDER BY last_message_time DESC
-       LIMIT $2 OFFSET $3`,
-      [req.userId, limit, offset]
+       LIMIT $3 OFFSET $4`,
+      [req.userId, typeFilter, limit, offset]
     );
 
-    res.json({ chats: result.rows });
+    const chats = result.rows.map((row) => ({
+      ...row,
+      ride_name:
+        row.type === 'ride' && row.ride_start_name && row.ride_dest_name
+          ? `${row.ride_start_name} -> ${row.ride_dest_name}`
+          : null,
+    }));
+
+    res.json({ chats });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Failed to fetch chats' });
@@ -38,14 +176,9 @@ router.get('/:chatId/messages', authMiddleware, async (req, res) => {
     const { page = 1, limit = 50 } = req.query;
     const offset = (page - 1) * limit;
 
-    // Verify user is participant
-    const participantCheck = await pool.query(
-      'SELECT * FROM Chat_Participants WHERE chat_id = $1 AND participant_id = $2',
-      [chatId, req.userId]
-    );
-
-    if (participantCheck.rows.length === 0) {
-      return res.status(403).json({ error: 'Not authorized' });
+    const authz = await isAuthorizedForChat(pool, chatId, req.userId);
+    if (!authz.ok) {
+      return res.status(authz.status).json({ error: authz.reason });
     }
 
     const messages = await pool.query(
@@ -89,6 +222,13 @@ router.post('/private/:otherUserId', authMiddleware, async (req, res) => {
 
     if (parseInt(otherUserId) === req.userId) {
       return res.status(400).json({ error: 'Cannot chat with yourself' });
+    }
+
+    const dmAllowed = await canUsersDirectMessage(client, req.userId, Number(otherUserId));
+    if (!dmAllowed) {
+      return res.status(403).json({
+        error: 'Direct message is allowed only for users with ride interaction',
+      });
     }
 
     await client.query('BEGIN');
@@ -148,14 +288,9 @@ router.post('/:chatId/messages', authMiddleware, async (req, res) => {
       return res.status(400).json({ error: 'Message content or media is required' });
     }
 
-    // Verify user is participant
-    const participantCheck = await client.query(
-      'SELECT * FROM Chat_Participants WHERE chat_id = $1 AND participant_id = $2',
-      [chatId, req.userId]
-    );
-
-    if (participantCheck.rows.length === 0) {
-      return res.status(403).json({ error: 'Not authorized' });
+    const authz = await isAuthorizedForChat(client, chatId, req.userId);
+    if (!authz.ok) {
+      return res.status(authz.status).json({ error: authz.reason });
     }
 
     await client.query('BEGIN');
@@ -175,6 +310,23 @@ router.post('/:chatId/messages', authMiddleware, async (req, res) => {
 
     await client.query('COMMIT');
 
+    // Notify other participants
+    const otherParticipants = await client.query(
+      'SELECT participant_id FROM Chat_Participants WHERE chat_id = $1 AND participant_id != $2',
+      [chatId, req.userId]
+    );
+
+    const senderResult = await client.query('SELECT name FROM "User" WHERE user_id = $1', [req.userId]);
+    const senderName = senderResult.rows[0]?.name || 'Someone';
+
+    for (const participant of otherParticipants.rows) {
+      await client.query(
+        `INSERT INTO Notification (user_id, type, message, related_user_id)
+         VALUES ($1, 'message', $2, $3)`,
+        [participant.participant_id, `New message from ${senderName}: ${content || 'Media'}`, req.userId]
+      );
+    }
+
     res.status(201).json({ message: result.rows[0] });
   } catch (err) {
     await client.query('ROLLBACK');
@@ -190,14 +342,9 @@ router.patch('/:chatId/messages/:messageId/read', authMiddleware, async (req, re
   try {
     const { chatId, messageId } = req.params;
 
-    // Verify user is participant
-    const participantCheck = await pool.query(
-      'SELECT * FROM Chat_Participants WHERE chat_id = $1 AND participant_id = $2',
-      [chatId, req.userId]
-    );
-
-    if (participantCheck.rows.length === 0) {
-      return res.status(403).json({ error: 'Not authorized' });
+    const authz = await isAuthorizedForChat(pool, chatId, req.userId);
+    if (!authz.ok) {
+      return res.status(authz.status).json({ error: authz.reason });
     }
 
     const result = await pool.query(
@@ -252,14 +399,9 @@ router.get('/:chatId', authMiddleware, async (req, res) => {
   try {
     const { chatId } = req.params;
 
-    // Verify user is participant
-    const participantCheck = await pool.query(
-      'SELECT * FROM Chat_Participants WHERE chat_id = $1 AND participant_id = $2',
-      [chatId, req.userId]
-    );
-
-    if (participantCheck.rows.length === 0) {
-      return res.status(403).json({ error: 'Not authorized' });
+    const authz = await isAuthorizedForChat(pool, chatId, req.userId);
+    if (!authz.ok) {
+      return res.status(authz.status).json({ error: authz.reason });
     }
 
     const chatResult = await pool.query('SELECT * FROM Chat WHERE chat_id = $1', [chatId]);

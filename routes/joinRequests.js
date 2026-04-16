@@ -4,6 +4,39 @@ const authMiddleware = require('../middleware/auth');
 
 const router = express.Router();
 
+const JOIN_BLOCKED_RIDE_STATUSES = new Set(['started', 'cancelled', 'completed', 'expired']);
+
+function toDateSafe(value) {
+  if (!value) {
+    return null;
+  }
+
+  if (value instanceof Date) {
+    return Number.isNaN(value.getTime()) ? null : value;
+  }
+
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    const hasTimezone = /(?:[zZ]|[+-]\d{2}:\d{2})$/.test(trimmed);
+    const normalized = hasTimezone ? trimmed : `${trimmed.replace(' ', 'T')}Z`;
+    const parsed = new Date(normalized);
+    if (!Number.isNaN(parsed.getTime())) {
+      return parsed;
+    }
+  }
+
+  const fallback = new Date(value);
+  return Number.isNaN(fallback.getTime()) ? null : fallback;
+}
+
+function hasRideReachedJoinCutoff(startTime) {
+  const startsAt = toDateSafe(startTime);
+  if (!startsAt) {
+    return true;
+  }
+  return startsAt <= new Date();
+}
+
 // Simple GET endpoint for /join-requests (must be after router is defined)
 router.get('/', (req, res) => {
   res.json({ status: 'JoinRequests endpoint is reachable.' });
@@ -38,6 +71,23 @@ async function getCurrentRequestStatus(client, requestId) {
     [requestId]
   );
   return logResult.rows.length > 0 ? logResult.rows[0].status : null;
+}
+
+async function getRideJoinInfo(client, rideId) {
+  const result = await client.query(
+    `SELECT r.ride_id, r.creator_id, r.available_seats, r.start_time,
+            to_char(r.start_time AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as start_time_utc,
+            r.start_location_id, r.dest_location_id, r.route_polyline,
+            COALESCE(
+              (SELECT status FROM Ride_Status_Log WHERE ride_id = r.ride_id ORDER BY timestamp DESC LIMIT 1),
+              'unactive'
+            ) as current_status
+     FROM Ride r
+     WHERE r.ride_id = $1`,
+    [rideId]
+  );
+
+  return result.rows[0] || null;
 }
 
 // Helper function to get or create location
@@ -97,38 +147,44 @@ router.post('/', authMiddleware, async (req, res) => {
       }
     }
 
-    // Check ride exists and has available seats
-    const rideResult = await client.query(
-      'SELECT available_seats, fare, creator_id, start_location_id, dest_location_id, route_polyline FROM Ride WHERE ride_id = $1',
-      [rideId]
-    );
+    // Check ride joinability and available seats
+    const rideResult = await getRideJoinInfo(client, rideId);
 
-    if (rideResult.rows.length === 0) {
+    if (!rideResult) {
       await client.query('ROLLBACK');
       return res.status(404).json({ error: 'Ride not found' });
     }
 
-    if (rideResult.rows[0].available_seats < 1) {
-      await client.query('ROLLBACK');
-      return res.status(400).json({ error: 'No seats available' });
-    }
-
-    // Prevent creator from joining their own ride
-    if (rideResult.rows[0].creator_id === req.userId) {
+    if (Number(rideResult.creator_id) === Number(req.userId)) {
       await client.query('ROLLBACK');
       return res.status(400).json({ error: 'You cannot join your own ride' });
     }
 
+    if (JOIN_BLOCKED_RIDE_STATUSES.has(rideResult.current_status)) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'This ride is no longer accepting join requests' });
+    }
+
+    if (hasRideReachedJoinCutoff(rideResult.start_time_utc || rideResult.start_time)) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'This ride has reached its join cutoff' });
+    }
+
+    if (rideResult.available_seats < 1) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'No seats available' });
+    }
+
     // Create locations if provided
-    let startLocationId = rideResult.rows[0].start_location_id;
-    let destLocationId = rideResult.rows[0].dest_location_id;
+    let startLocationId = rideResult.start_location_id;
+    let destLocationId = rideResult.dest_location_id;
 
     if (startLocation) {
       startLocationId = await getOrCreateLocation(
         client,
         startLocation.name || startLocation.address,
-        startLocation.latitude,
-        startLocation.longitude
+        startLocation.latitude !== undefined ? startLocation.latitude : startLocation.lat,
+        startLocation.longitude !== undefined ? startLocation.longitude : startLocation.lng
       );
     }
 
@@ -136,8 +192,8 @@ router.post('/', authMiddleware, async (req, res) => {
       destLocationId = await getOrCreateLocation(
         client,
         endLocation.name || endLocation.address,
-        endLocation.latitude,
-        endLocation.longitude
+        endLocation.latitude !== undefined ? endLocation.latitude : endLocation.lat,
+        endLocation.longitude !== undefined ? endLocation.longitude : endLocation.lng
       );
     }
 
@@ -153,7 +209,7 @@ router.post('/', authMiddleware, async (req, res) => {
          parsedRoutePolyline = JSON.stringify(parsed);
       }
     } else {
-      parsedRoutePolyline = rideResult.rows[0].route_polyline;
+      parsedRoutePolyline = rideResult.route_polyline;
     }
 
     // Insert join request
@@ -177,7 +233,7 @@ router.post('/', authMiddleware, async (req, res) => {
     await addRequestStatus(client, joinRequest.request_id, 'pending');
 
     // Create notification for ride creator
-    console.log('Creating notification for ride creator:', rideResult.rows[0].creator_id);
+    console.log('Creating notification for ride creator:', rideResult.creator_id);
     console.log('Join request ID:', joinRequest.request_id);
 
     const requesterResult = await client.query(
@@ -191,7 +247,7 @@ router.post('/', authMiddleware, async (req, res) => {
        VALUES ($1, $2, $3, $4, $5, $6)
        RETURNING *`,
       [
-        rideResult.rows[0].creator_id,
+        rideResult.creator_id,
         'join_request',
         `${requesterName} wants to join your ride`,
         rideId,
@@ -243,7 +299,7 @@ router.get('/ride/:rideId', authMiddleware, async (req, res) => {
       return res.status(404).json({ error: 'Ride not found' });
     }
 
-    if (rideResult.rows[0].creator_id !== req.userId) {
+    if (Number(rideResult.rows[0].creator_id) !== Number(req.userId)) {
       return res.status(403).json({ error: 'Not authorized' });
     }
 
@@ -359,7 +415,7 @@ router.patch('/:requestId/accept', authMiddleware, async (req, res) => {
 
     // Get join request and verify creator ownership
     const requestResult = await client.query(
-      `SELECT jr.*, r.creator_id, r.available_seats, r.fare
+      `SELECT jr.*, r.creator_id, r.available_seats, r.fare, r.start_time
        FROM Join_Request jr
        JOIN Ride r ON jr.ride_id = r.ride_id
        WHERE jr.request_id = $1`,
@@ -373,9 +429,25 @@ router.patch('/:requestId/accept', authMiddleware, async (req, res) => {
 
     const request = requestResult.rows[0];
 
-    if (request.creator_id !== req.userId) {
+    if (Number(request.creator_id) !== Number(req.userId)) {
       await client.query('ROLLBACK');
       return res.status(403).json({ error: 'Not authorized' });
+    }
+
+    const requestStatus = await getCurrentRequestStatus(client, req.params.requestId);
+    if (requestStatus !== 'pending') {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Only pending requests can be accepted' });
+    }
+
+    const rideJoinInfo = await getRideJoinInfo(client, request.ride_id);
+    if (!rideJoinInfo) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Ride not found' });
+    }
+    if (JOIN_BLOCKED_RIDE_STATUSES.has(rideJoinInfo.current_status) || hasRideReachedJoinCutoff(rideJoinInfo.start_time_utc || rideJoinInfo.start_time)) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'This ride is no longer accepting join requests' });
     }
 
     if (request.available_seats < 1) {
@@ -398,7 +470,7 @@ router.patch('/:requestId/accept', authMiddleware, async (req, res) => {
        VALUES ($1, $2, $3, $4, $5, $6)`,
       [
         request.partner_id,
-        'join_request_accepted',
+        'ride_update',
         'Your request to join the ride was accepted!',
         request.ride_id,
         req.userId,
@@ -411,6 +483,26 @@ router.patch('/:requestId/accept', authMiddleware, async (req, res) => {
       `UPDATE Notification SET is_read = true WHERE related_request_id = $1 AND type = 'join_request'`,
       [req.params.requestId]
     );
+
+    // Add passenger to ride chat
+    const chatResult = await client.query(
+      'SELECT chat_id FROM Chat WHERE ride_id = $1 AND type = \'ride\'',
+      [request.ride_id]
+    );
+    if (chatResult.rows.length > 0) {
+      const chatId = chatResult.rows[0].chat_id;
+      // Check if already in chat (though they shouldn't be)
+      const participantCheck = await client.query(
+        'SELECT * FROM Chat_Participants WHERE chat_id = $1 AND participant_id = $2',
+        [chatId, request.partner_id]
+      );
+      if (participantCheck.rows.length === 0) {
+        await client.query(
+          'INSERT INTO Chat_Participants (chat_id, participant_id, role) VALUES ($1, $2, \'requester\')',
+          [chatId, request.partner_id]
+        );
+      }
+    }
 
     await client.query('COMMIT');
 
@@ -444,13 +536,19 @@ router.patch('/:requestId/reject', authMiddleware, async (req, res) => {
       return res.status(404).json({ error: 'Join request not found' });
     }
 
-    if (requestResult.rows[0].creator_id !== req.userId) {
+    if (Number(requestResult.rows[0].creator_id) !== Number(req.userId)) {
       await client.query('ROLLBACK');
       return res.status(403).json({ error: 'Not authorized' });
     }
 
     const partnerId = requestResult.rows[0].partner_id;
     const rideId = requestResult.rows[0].ride_id;
+
+    const requestStatus = await getCurrentRequestStatus(client, req.params.requestId);
+    if (requestStatus !== 'pending') {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Only pending requests can be rejected' });
+    }
 
     // Update status
     await addRequestStatus(client, req.params.requestId, 'rejected');
@@ -461,7 +559,7 @@ router.patch('/:requestId/reject', authMiddleware, async (req, res) => {
        VALUES ($1, $2, $3, $4, $5, $6)`,
       [
         partnerId,
-        'join_request_rejected',
+        'ride_update',
         'Your request to join the ride was rejected',
         rideId,
         req.userId,
@@ -490,13 +588,12 @@ router.patch('/:requestId/reject', authMiddleware, async (req, res) => {
 // Cancel a join request (by partner)
 router.patch('/:requestId/cancel', authMiddleware, async (req, res) => {
   const client = await pool.connect();
-  
   try {
     await client.query('BEGIN');
 
     // Verify partner ownership
     const requestResult = await client.query(
-      'SELECT partner_id FROM Join_Request WHERE request_id = $1',
+      'SELECT partner_id, ride_id FROM Join_Request WHERE request_id = $1',
       [req.params.requestId]
     );
 
@@ -505,13 +602,37 @@ router.patch('/:requestId/cancel', authMiddleware, async (req, res) => {
       return res.status(404).json({ error: 'Join request not found' });
     }
 
-    if (requestResult.rows[0].partner_id !== req.userId) {
+    if (Number(requestResult.rows[0].partner_id) !== Number(req.userId)) {
       await client.query('ROLLBACK');
       return res.status(403).json({ error: 'Not authorized' });
     }
 
+    const rideJoinInfo = await getRideJoinInfo(client, requestResult.rows[0].ride_id);
+    if (!rideJoinInfo) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Ride not found' });
+    }
+
+    if (JOIN_BLOCKED_RIDE_STATUSES.has(rideJoinInfo.current_status) || hasRideReachedJoinCutoff(rideJoinInfo.start_time_utc || rideJoinInfo.start_time)) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'This ride is no longer accepting cancellation changes' });
+    }
+
+    const requestStatus = await getCurrentRequestStatus(client, req.params.requestId);
+    if (requestStatus !== 'pending' && requestStatus !== 'accepted') {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Only active requests can be cancelled' });
+    }
+
     // Update status
     await addRequestStatus(client, req.params.requestId, 'cancelled');
+
+    if (requestStatus === 'accepted') {
+      await client.query(
+        'UPDATE Ride SET available_seats = available_seats + 1 WHERE ride_id = $1',
+        [requestResult.rows[0].ride_id]
+      );
+    }
 
     await client.query('COMMIT');
 
