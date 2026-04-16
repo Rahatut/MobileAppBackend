@@ -219,16 +219,19 @@ router.post('/private/:otherUserId', authMiddleware, async (req, res) => {
 
   try {
     const { otherUserId } = req.params;
+    const parsedOtherUserId = Number(otherUserId);
 
-    if (parseInt(otherUserId) === req.userId) {
+    if (!Number.isInteger(parsedOtherUserId) || parsedOtherUserId <= 0) {
+      return res.status(400).json({ error: 'Invalid user id' });
+    }
+
+    if (parsedOtherUserId === req.userId) {
       return res.status(400).json({ error: 'Cannot chat with yourself' });
     }
 
-    const dmAllowed = await canUsersDirectMessage(client, req.userId, Number(otherUserId));
-    if (!dmAllowed) {
-      return res.status(403).json({
-        error: 'Direct message is allowed only for users with ride interaction',
-      });
+    const userResult = await client.query('SELECT user_id FROM "User" WHERE user_id = $1', [parsedOtherUserId]);
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
     }
 
     await client.query('BEGIN');
@@ -240,7 +243,7 @@ router.post('/private/:otherUserId', authMiddleware, async (req, res) => {
        JOIN Chat_Participants cp2 ON c.chat_id = cp2.chat_id
        WHERE c.type = 'private'
        AND cp1.participant_id = $1 AND cp2.participant_id = $2`,
-      [req.userId, otherUserId]
+      [req.userId, parsedOtherUserId]
     );
 
     if (existingChat.rows.length > 0) {
@@ -261,7 +264,7 @@ router.post('/private/:otherUserId', authMiddleware, async (req, res) => {
       `INSERT INTO Chat_Participants (chat_id, participant_id, role) VALUES 
        ($1, $2, 'creator'),
        ($1, $3, 'friend')`,
-      [chat.chat_id, req.userId, otherUserId]
+      [chat.chat_id, req.userId, parsedOtherUserId]
     );
 
     await client.query('COMMIT');

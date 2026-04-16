@@ -109,6 +109,7 @@ BEGIN
         (r.start_time AT TIME ZONE 'UTC') AS start_time,
         r.gender_preference::text,
         r.preference_notes::text,
+        r.transport_detail::text,
         r.transport_mode,
         r.ride_provider,
         r.fare,

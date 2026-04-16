@@ -1,0 +1,2 @@
+ALTER TABLE Ride
+ADD COLUMN IF NOT EXISTS transport_detail TEXT;
