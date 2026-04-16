@@ -29,7 +29,7 @@ app.use('/api/payments', paymentsRoutes);
 app.use('/api/ratings', ratingsRoutes);
 app.use('/api/notifications', notificationsRoutes);
 app.use('/api/chats', chatRoutes);
-app.use('/feedback', feedbackRoutes);
+app.use('/api/feedback', feedbackRoutes);
 
 // Health check
 app.get('/api/health', (req, res) => {
