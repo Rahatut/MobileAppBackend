@@ -163,6 +163,14 @@ router.patch('/request/:requestId/accept', authMiddleware, async (req, res) => {
       [user1Id, user2Id]
     );
 
+    // Notify the sender
+    const receiverResult = await client.query('SELECT name FROM "User" WHERE user_id = $1', [req.userId]);
+    const receiverName = receiverResult.rows[0]?.name || 'Someone';
+    await client.query(
+      `INSERT INTO Notification (user_id, type, message, related_user_id) VALUES ($1, $2, $3, $4)`,
+      [request.sender_id, 'friend_request', `${receiverName} accepted your friend request.`, req.userId]
+    );
+
     await client.query('COMMIT');
 
     res.json({ message: 'Friend request accepted' });

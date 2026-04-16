@@ -12,17 +12,21 @@ router.post('/register', async (req, res) => {
   
   try {
     const { email, password, name, username, phone, gender, university, department, address, fb } = req.body;
+    const normalizedGender = typeof gender === 'string' ? gender.trim().toLowerCase() : null;
+    const allowedGenders = new Set(['male', 'female', 'other']);
 
     if (!email || !password) {
       return res.status(400).json({ error: 'Email and password required' });
     }
+
+    const finalGender = allowedGenders.has(normalizedGender) ? normalizedGender : null;
 
     await client.query('BEGIN');
 
     // Create user
     const userResult = await client.query(
       'INSERT INTO "User" (name, username, phone, gender, university, department, address, fb) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING user_id, user_uuid, name, username, gender, phone, university, department, address, fb',
-      [name, username, phone, gender, university, department, address, fb]
+      [name, username, phone, finalGender, university, department, address, fb]
     );
 
     const { user_id, user_uuid } = userResult.rows[0];

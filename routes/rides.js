@@ -5,9 +5,62 @@ const authMiddleware = require('../middleware/auth');
 
 const router = express.Router();
 
+const FINAL_RIDE_STATUSES = new Set(['cancelled', 'completed', 'expired']);
+
+function toDateSafe(value) {
+  if (!value) {
+    return null;
+  }
+
+  if (value instanceof Date) {
+    return Number.isNaN(value.getTime()) ? null : value;
+  }
+
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    const hasTimezone = /(?:[zZ]|[+-]\d{2}:\d{2})$/.test(trimmed);
+    const normalized = hasTimezone ? trimmed : `${trimmed.replace(' ', 'T')}Z`;
+    const parsed = new Date(normalized);
+    if (!Number.isNaN(parsed.getTime())) {
+      return parsed;
+    }
+  }
+
+  const fallback = new Date(value);
+  return Number.isNaN(fallback.getTime()) ? null : fallback;
+}
+
+function hasRideReachedJoinCutoff(startTime) {
+  const startsAt = toDateSafe(startTime);
+  if (!startsAt) {
+    return true;
+  }
+  return startsAt <= new Date();
+}
+
+async function getRideLifecycle(client, rideId) {
+  const result = await client.query(
+    `SELECT r.ride_id, r.creator_id, r.start_time,
+            to_char(r.start_time AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as start_time_utc,
+            r.available_seats,
+            COALESCE(
+              (SELECT status FROM Ride_Status_Log WHERE ride_id = r.ride_id ORDER BY timestamp DESC LIMIT 1),
+              'unactive'
+            ) as current_status
+     FROM Ride r
+     WHERE r.ride_id = $1`,
+    [rideId]
+  );
+
+  return result.rows[0] || null;
+}
+
 // Remove a passenger from a ride (creator only)
 router.delete('/:rideId/passenger/:passengerId', authMiddleware, async (req, res) => {
   const { rideId, passengerId } = req.params;
+  const shouldReport = Boolean(req.body?.report);
+  const reportReason = typeof req.body?.reportReason === 'string' ? req.body.reportReason.trim() : null;
+  const reportDetails = typeof req.body?.reportDetails === 'string' ? req.body.reportDetails.trim() : null;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -34,18 +87,66 @@ router.delete('/:rideId/passenger/:passengerId', authMiddleware, async (req, res
       return res.status(404).json({ error: 'Passenger not found in this ride' });
     }
     const requestId = joinResult.rows[0].request_id;
+
+    const rideLifecycle = await getRideLifecycle(client, rideId);
+    if (!rideLifecycle) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Ride not found' });
+    }
+    if (rideLifecycle.current_status !== 'unactive' || hasRideReachedJoinCutoff(rideLifecycle.start_time_utc || rideLifecycle.start_time)) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Passengers can only be removed before the ride starts' });
+    }
+
     // Mark join request as removed
     await client.query(
       'INSERT INTO Request_Status_Log (request_id, status) VALUES ($1, $2)',
-      [requestId, 'removed']
+      [requestId, 'cancelled']
     );
     // Increment available_seats for the ride
     await client.query(
       'UPDATE Ride SET available_seats = available_seats + 1 WHERE ride_id = $1',
       [rideId]
     );
+
+    let reportId = null;
+    if (shouldReport) {
+      const reportInsert = await client.query(
+        `INSERT INTO Passenger_Report (
+          ride_id,
+          request_id,
+          reporter_user_id,
+          reported_user_id,
+          reason,
+          details
+        ) VALUES ($1, $2, $3, $4, $5, $6)
+        RETURNING report_id`,
+        [
+          rideId,
+          requestId,
+          req.userId,
+          passengerId,
+          reportReason || 'creator_reported_on_removal',
+          reportDetails || null,
+        ]
+      );
+      reportId = reportInsert.rows[0]?.report_id || null;
+    }
+
     await client.query('COMMIT');
-    return res.json({ message: 'Passenger removed from ride, seat is now available' });
+
+    // Notify the removed passenger
+    await client.query(
+      `INSERT INTO Notification (user_id, type, message, related_ride_id, related_user_id)
+       VALUES ($1, 'passenger_removed', 'You were removed from the ride', $2, $3)`,
+      [passengerId, rideId, req.userId]
+    );
+
+    return res.json({
+      message: 'Passenger removed from ride, seat is now available',
+      reportCreated: shouldReport,
+      reportId,
+    });
   } catch (err) {
     await client.query('ROLLBACK');
     console.error(err);
@@ -67,9 +168,13 @@ router.post('/:rideId/join', authMiddleware, async (req, res) => {
 
     await client.query('BEGIN');
 
-    // Fetch original ride's start and destination locations
+    // Fetch original ride state and locations
     const rideDetailsResult = await client.query(
-      `SELECT start_location_id, dest_location_id
+      `SELECT r.start_location_id, r.dest_location_id, r.creator_id, r.available_seats, r.start_time,
+              COALESCE(
+                (SELECT status FROM Ride_Status_Log WHERE ride_id = r.ride_id ORDER BY timestamp DESC LIMIT 1),
+                'unactive'
+              ) as current_status
        FROM Ride WHERE ride_id = $1`,
       [rideId]
     );
@@ -80,6 +185,26 @@ router.post('/:rideId/join', authMiddleware, async (req, res) => {
     }
 
     const originalRide = rideDetailsResult.rows[0];
+
+    if (Number(originalRide.creator_id) === Number(partnerId)) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'You cannot join your own ride' });
+    }
+
+    if (originalRide.current_status !== 'unactive') {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'This ride is no longer accepting join requests' });
+    }
+
+    if (hasRideReachedJoinCutoff(originalRide.start_time_utc || originalRide.start_time)) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'This ride has reached its join cutoff' });
+    }
+
+    if (originalRide.available_seats < 1) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'No seats available' });
+    }
 
     let finalStartLocationId;
     let finalDestLocationId;
@@ -195,6 +320,7 @@ router.post('/', authMiddleware, async (req, res) => {
       endLocation,
       startTime,
       transportMode,
+      transportDetail,
       rideProvider,
       availableSeats,
       fare,
@@ -214,24 +340,24 @@ router.post('/', authMiddleware, async (req, res) => {
       client,
       startLocation.name || startLocation.address,
       startLocation.address,
-      startLocation.latitude,
-      startLocation.longitude
+      startLocation.latitude !== undefined ? startLocation.latitude : startLocation.lat,
+      startLocation.longitude !== undefined ? startLocation.longitude : startLocation.lng
     );
 
     const destLocationId = await getOrCreateLocation(
       client,
       endLocation.name || endLocation.address,
       endLocation.address,
-      endLocation.latitude,
-      endLocation.longitude
+      endLocation.latitude !== undefined ? endLocation.latitude : endLocation.lat,
+      endLocation.longitude !== undefined ? endLocation.longitude : endLocation.lng
     );
 
     // Create ride
     const rideResult = await client.query(
       `INSERT INTO Ride (creator_id, start_location_id, dest_location_id, start_time, 
-                         transport_mode, ride_provider, available_seats, fare, 
+                         transport_mode, transport_detail, ride_provider, available_seats, fare, 
                          gender_preference, preference_notes, route_polyline)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
        RETURNING *`,
       [
         req.userId,
@@ -239,6 +365,7 @@ router.post('/', authMiddleware, async (req, res) => {
         destLocationId,
         startTime,
         transportMode,
+        transportDetail || null,
         rideProvider || 'Private',
         availableSeats,
         fare,
@@ -264,6 +391,19 @@ router.post('/', authMiddleware, async (req, res) => {
 
     // Add initial status
     await addRideStatus(client, ride.ride_id, 'unactive');
+
+    // Create ride chat
+    const chatResult = await client.query(
+      `INSERT INTO Chat (ride_id, type, created_by) VALUES ($1, 'ride', $2) RETURNING chat_id`,
+      [ride.ride_id, req.userId]
+    );
+    const chat = chatResult.rows[0];
+
+    // Add creator to chat
+    await client.query(
+      `INSERT INTO Chat_Participants (chat_id, participant_id, role) VALUES ($1, $2, 'creator')`,
+      [chat.chat_id, req.userId]
+    );
 
     const fullRideResult = await client.query(
       `SELECT r.*, 
@@ -327,7 +467,7 @@ router.get('/', authMiddleware, async (req, res) => {
         $2::double precision, $3::double precision,
         $4::double precision, $5::double precision,
         $6::double precision,
-        $7::transport_mode_enum, $8::gender_enum,
+        $7::transport_mode_enum, $8::text,
         $9::timestamp with time zone, $10::timestamp with time zone,
         $11::text
       )`,
@@ -441,12 +581,14 @@ router.get('/:identifier', async (req, res) => {
       return res.status(404).json({ error: 'Ride not found' });
     }
 
-    // Get passengers/partners for this ride, including pickup/dropoff coordinates
+    // Get passengers/partners for this ride, including pickup/dropoff coordinates and route polyline
     const passengersResult = await pool.query(
       `SELECT u.user_id, u.user_uuid, u.name, u.username, u.avatar_url, u.avg_rating,
+              jr.request_id,
               (SELECT status FROM Request_Status_Log WHERE request_id = jr.request_id ORDER BY timestamp DESC LIMIT 1) as status,
               sl.name as start_name, sl.address as start_address, sl.latitude as start_lat, sl.longitude as start_lng,
-              dl.name as dest_name, dl.address as dest_address, dl.latitude as dest_lat, dl.longitude as dest_lng
+              dl.name as dest_name, dl.address as dest_address, dl.latitude as dest_lat, dl.longitude as dest_lng,
+              jr.route_polyline
        FROM Join_Request jr
        JOIN "User" u ON jr.partner_id = u.user_id
        LEFT JOIN Location_Info sl ON jr.start_location_id = sl.location_id
@@ -474,7 +616,7 @@ router.get('/:identifier', async (req, res) => {
 // Edit ride details (creator only)
 router.put('/:rideId', authMiddleware, async (req, res) => {
   const { rideId } = req.params;
-  const { fare, transportMode, rideProvider, genderPreference, availableSeats, notes } = req.body;
+  const { startTime, fare, transportMode, transportDetail, rideProvider, genderPreference, availableSeats, notes } = req.body;
   const client = await pool.connect();
 
   try {
@@ -498,18 +640,22 @@ router.put('/:rideId', authMiddleware, async (req, res) => {
 
     const updateResult = await client.query(
       `UPDATE Ride
-       SET fare               = COALESCE($1, fare),
-           transport_mode     = COALESCE($2, transport_mode),
-           ride_provider      = COALESCE($3, ride_provider),
-           gender_preference  = COALESCE($4, gender_preference),
-           available_seats    = COALESCE($5, available_seats),
-           preference_notes   = COALESCE($6, preference_notes),
+       SET start_time         = COALESCE($1, start_time),
+           fare               = COALESCE($2, fare),
+           transport_mode     = COALESCE($3, transport_mode),
+           transport_detail   = COALESCE($4, transport_detail),
+           ride_provider      = COALESCE($5, ride_provider),
+           gender_preference  = COALESCE($6, gender_preference),
+           available_seats    = COALESCE($7, available_seats),
+           preference_notes   = COALESCE($8, preference_notes),
            updated_at         = CURRENT_TIMESTAMP
-       WHERE ride_id = $7
+       WHERE ride_id = $9
        RETURNING *`,
       [
-        fare !== undefined ? parseFloat(fare) : null,
+        startTime || null,
+        fare !== undefined && fare !== null ? parseFloat(fare) : null,
         transportMode || null,
+        transportDetail !== undefined ? transportDetail : null,
         rideProvider || null,
         genderPreference || null,
         availableSeats !== undefined ? parseInt(availableSeats) : null,
@@ -518,9 +664,47 @@ router.put('/:rideId', authMiddleware, async (req, res) => {
       ]
     );
 
+    const fullRideResult = await client.query(
+      `SELECT r.*, 
+              to_char(r.start_time AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as start_time,
+              u.name, u.username, u.user_uuid, u.avatar_url, u.avg_rating,
+              sl.name as start_name, sl.address as start_address, sl.latitude as start_lat, sl.longitude as start_lng,
+              dl.name as dest_name, dl.address as dest_address, dl.latitude as dest_lat, dl.longitude as dest_lng,
+              (SELECT status FROM Ride_Status_Log WHERE ride_id = r.ride_id ORDER BY timestamp DESC LIMIT 1) as current_status
+       FROM Ride r
+       JOIN "User" u ON r.creator_id = u.user_id
+       LEFT JOIN Location_Info sl ON r.start_location_id = sl.location_id
+       LEFT JOIN Location_Info dl ON r.dest_location_id = dl.location_id
+       WHERE r.ride_id = $1`,
+      [rideId]
+    );
+
     await client.query('COMMIT');
 
-    return res.json({ message: 'Ride updated', ride: updateResult.rows[0] });
+    // Notify all accepted passengers
+    const passengersResult = await client.query(
+      `SELECT partner_id FROM Join_Request jr
+       WHERE ride_id = $1 
+       AND (SELECT status FROM Request_Status_Log WHERE request_id = jr.request_id ORDER BY timestamp DESC LIMIT 1) = 'accepted'`,
+      [rideId]
+    );
+    for (const passenger of passengersResult.rows) {
+      await client.query(
+        `INSERT INTO Notification (user_id, type, message, related_ride_id, related_user_id)
+         VALUES ($1, 'ride_edited', 'The ride details have been updated', $2, $3)`,
+        [passenger.partner_id, rideId, req.userId]
+      );
+    }
+
+    const totalPassengers = fullRideResult.rows[0].total_passengers || fullRideResult.rows[0].totalPassengers || fullRideResult.rows[0].available_seats || 0;
+
+    return res.json({
+      message: 'Ride updated',
+      ride: {
+        ...fullRideResult.rows[0],
+        totalPassengers,
+      },
+    });
   } catch (err) {
     await client.query('ROLLBACK');
     console.error(err);
@@ -535,7 +719,8 @@ router.patch('/:rideId/status', authMiddleware, async (req, res) => {
   const client = await pool.connect();
   
   try {
-    const { status } = req.body;
+    const rideId = req.params.rideId;
+    const { status, transferToUserId, forceCancel } = req.body;
 
     if (!['unactive', 'started', 'cancelled', 'completed', 'expired'].includes(status)) {
       return res.status(400).json({ error: 'Invalid status' });
@@ -544,24 +729,198 @@ router.patch('/:rideId/status', authMiddleware, async (req, res) => {
     await client.query('BEGIN');
 
     // Verify ownership
-    const rideResult = await client.query('SELECT creator_id FROM Ride WHERE ride_id = $1', [req.params.rideId]);
+    const rideLifecycle = await getRideLifecycle(client, rideId);
 
-    if (rideResult.rows.length === 0) {
+    if (!rideLifecycle) {
       await client.query('ROLLBACK');
       return res.status(404).json({ error: 'Ride not found' });
     }
 
-    if (rideResult.rows[0].creator_id !== req.userId) {
+    if (Number(rideLifecycle.creator_id) !== Number(req.userId)) {
       await client.query('ROLLBACK');
       return res.status(403).json({ error: 'Not authorized' });
     }
 
-    // Add status log
-    await addRideStatus(client, req.params.rideId, status);
+    const currentStatus = rideLifecycle.current_status || 'unactive';
+    if (currentStatus === status) {
+      await client.query('ROLLBACK');
+      return res.json({ message: 'Ride status already set', status });
+    }
+
+    const allowedTransitions = {
+      unactive: new Set(['started', 'cancelled', 'expired', 'completed']),
+      started: new Set(['completed', 'cancelled', 'expired']),
+      cancelled: new Set([]),
+      completed: new Set([]),
+      expired: new Set([]),
+    };
+
+    if (!allowedTransitions[currentStatus] || !allowedTransitions[currentStatus].has(status)) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: `Cannot change ride status from ${currentStatus} to ${status}` });
+    }
+
+    if (status === 'started' && toDateSafe(rideLifecycle.start_time_utc || rideLifecycle.start_time) > new Date()) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Ride cannot be started before its scheduled start time' });
+    }
+
+    let ownershipTransferred = false;
+    let newCreatorId = null;
+    let finalStatus = status;
+
+    if (status === 'cancelled') {
+      const acceptedPassengersResult = await client.query(
+        `SELECT jr.request_id, jr.partner_id
+         FROM Join_Request jr
+         WHERE jr.ride_id = $1
+         AND (SELECT status FROM Request_Status_Log WHERE request_id = jr.request_id ORDER BY timestamp DESC LIMIT 1) = 'accepted'
+         ORDER BY jr.timestamp ASC, jr.request_id ASC`,
+        [rideId]
+      );
+
+      if (acceptedPassengersResult.rows.length > 0 && !forceCancel) {
+        ownershipTransferred = true;
+        let promoted = acceptedPassengersResult.rows[0];
+        if (transferToUserId != null) {
+          const explicit = acceptedPassengersResult.rows.find(
+            (row) => Number(row.partner_id) === Number(transferToUserId)
+          );
+          if (!explicit) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: 'Selected transfer user is not an accepted passenger' });
+          }
+          promoted = explicit;
+        }
+        newCreatorId = Number(promoted.partner_id);
+
+        // Promoted passenger becomes creator, so their accepted join seat is freed.
+        await client.query(
+          `UPDATE Ride
+           SET creator_id = $1,
+               available_seats = available_seats + 1,
+               updated_at = CURRENT_TIMESTAMP
+           WHERE ride_id = $2`,
+          [newCreatorId, rideId]
+        );
+
+        await client.query(
+          'INSERT INTO Request_Status_Log (request_id, status) VALUES ($1, $2)',
+          [promoted.request_id, 'cancelled']
+        );
+        await client.query(
+          'UPDATE Join_Request SET status = $1 WHERE request_id = $2',
+          ['cancelled', promoted.request_id]
+        );
+
+        await client.query(
+          `UPDATE Chat_Participants cp
+           SET role = CASE
+             WHEN cp.participant_id = $1 THEN 'creator'::chat_role_enum
+             WHEN cp.participant_id = $2 AND cp.role = 'creator'::chat_role_enum THEN 'partner'::chat_role_enum
+             ELSE cp.role
+           END
+           WHERE cp.chat_id IN (
+             SELECT chat_id FROM Chat WHERE ride_id = $3 AND type = 'ride'
+           )
+           AND cp.participant_id IN ($1, $2)`,
+          [newCreatorId, req.userId, rideId]
+        );
+
+        // Keep ride active with its current status instead of cancelling.
+        finalStatus = currentStatus;
+      } else {
+        await addRideStatus(client, rideId, status);
+        finalStatus = status;
+      }
+    } else {
+      await addRideStatus(client, rideId, status);
+      finalStatus = status;
+    }
 
     await client.query('COMMIT');
 
-    res.json({ message: 'Ride status updated', status });
+    if (ownershipTransferred) {
+        await client.query(
+          `INSERT INTO Notification (user_id, type, message, related_ride_id, related_user_id)
+           VALUES ($1, 'ride_update', 'You are now the ride creator for this ride.', $2, $3)`,
+          [newCreatorId, rideId, req.userId]
+        );
+
+        await client.query(
+          `INSERT INTO Notification (user_id, type, message, related_ride_id, related_user_id)
+           VALUES ($1, 'ride_update', 'Ownership was transferred to a passenger instead of cancelling the ride.', $2, $3)`,
+          [req.userId, rideId, newCreatorId]
+        );
+
+        const remainingPassengersResult = await client.query(
+          `SELECT partner_id FROM Join_Request jr
+           WHERE ride_id = $1
+           AND partner_id <> $2
+           AND (SELECT status FROM Request_Status_Log WHERE request_id = jr.request_id ORDER BY timestamp DESC LIMIT 1) = 'accepted'`,
+          [rideId, newCreatorId]
+        );
+
+        for (const passenger of remainingPassengersResult.rows) {
+          await client.query(
+            `INSERT INTO Notification (user_id, type, message, related_ride_id, related_user_id)
+             VALUES ($1, 'ride_update', 'Ride creator has changed. The ride is still active.', $2, $3)`,
+            [passenger.partner_id, rideId, newCreatorId]
+          );
+        }
+    } else if (status === 'cancelled') {
+        const passengersResult = await client.query(
+          `SELECT partner_id FROM Join_Request jr
+           WHERE ride_id = $1 
+           AND (SELECT status FROM Request_Status_Log WHERE request_id = jr.request_id ORDER BY timestamp DESC LIMIT 1) = 'accepted'`,
+          [rideId]
+        );
+        for (const passenger of passengersResult.rows) {
+          await client.query(
+            `INSERT INTO Notification (user_id, type, message, related_ride_id, related_user_id)
+             VALUES ($1, 'ride_cancelled', 'The ride has been cancelled by the creator', $2, $3)`,
+            [passenger.partner_id, rideId, req.userId]
+          );
+        }
+    } else {
+        // General status update (started, etc.)
+        const passengersResult = await client.query(
+          `SELECT partner_id FROM Join_Request jr
+           WHERE ride_id = $1 
+           AND (SELECT status FROM Request_Status_Log WHERE request_id = jr.request_id ORDER BY timestamp DESC LIMIT 1) = 'accepted'`,
+          [rideId]
+        );
+        for (const passenger of passengersResult.rows) {
+          await client.query(
+            `INSERT INTO Notification (user_id, type, message, related_ride_id, related_user_id)
+             VALUES ($1, 'ride_update', $2, $3, $4)`,
+            [passenger.partner_id, 'ride_update', `Ride status updated to ${status}`, rideId, req.userId]
+          );
+        }
+    }
+
+    const fullRideResult = await client.query(
+      `SELECT r.*, 
+              to_char(r.start_time AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as start_time,
+              u.name, u.username, u.user_uuid, u.avatar_url, u.avg_rating,
+              sl.name as start_name, sl.address as start_address, sl.latitude as start_lat, sl.longitude as start_lng,
+              dl.name as dest_name, dl.address as dest_address, dl.latitude as dest_lat, dl.longitude as dest_lng,
+              (SELECT status FROM Ride_Status_Log WHERE ride_id = r.ride_id ORDER BY timestamp DESC LIMIT 1) as current_status
+       FROM Ride r
+       JOIN "User" u ON r.creator_id = u.user_id
+       LEFT JOIN Location_Info sl ON r.start_location_id = sl.location_id
+       LEFT JOIN Location_Info dl ON r.dest_location_id = dl.location_id
+       WHERE r.ride_id = $1`,
+      [rideId]
+    );
+
+    res.json({
+      message: ownershipTransferred ? 'Ride ownership transferred to a passenger. Ride remains active.' : 'Ride status updated',
+      status: finalStatus,
+      ownershipTransferred,
+      newCreatorId,
+      ride: fullRideResult.rows[0] || null,
+    });
   } catch (err) {
     await client.query('ROLLBACK');
     console.error(err);
@@ -586,23 +945,42 @@ router.post('/:rideId/complete', authMiddleware, async (req, res) => {
     await client.query('BEGIN');
 
     // Verify ownership
-    const rideResult = await client.query(
-      'SELECT creator_id, fare, start_time FROM Ride WHERE ride_id = $1',
-      [rideId]
-    );
+    const rideLifecycle = await getRideLifecycle(client, rideId);
 
-    if (rideResult.rows.length === 0) {
+    if (!rideLifecycle) {
       await client.query('ROLLBACK');
       return res.status(404).json({ error: 'Ride not found' });
     }
 
-    if (rideResult.rows[0].creator_id !== req.userId) {
+    if (Number(rideLifecycle.creator_id) !== Number(req.userId)) {
       await client.query('ROLLBACK');
       return res.status(403).json({ error: 'Not authorized' });
     }
 
-    const ride = rideResult.rows[0];
-    const tripDuration = new Date(completionTime || new Date()) - new Date(ride.start_time);
+    const currentStatus = rideLifecycle.current_status || 'unactive';
+    const completionMoment = completionTime || new Date();
+    const startedAt = toDateSafe(rideLifecycle.start_time_utc || rideLifecycle.start_time);
+
+    if (!startedAt) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Ride has invalid start time data' });
+    }
+
+    if (FINAL_RIDE_STATUSES.has(currentStatus)) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Ride is already closed' });
+    }
+
+    if (currentStatus === 'unactive' && startedAt > new Date(completionMoment)) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Ride cannot be completed before it starts' });
+    }
+
+    if (currentStatus === 'unactive' && startedAt <= new Date(completionMoment)) {
+      await addRideStatus(client, rideId, 'started');
+    }
+
+    const tripDuration = new Date(completionMoment) - startedAt;
     const tripDurationMinutes = Math.round(tripDuration / 60000);
 
     // Update ride with completion details
@@ -614,7 +992,7 @@ router.post('/:rideId/complete', authMiddleware, async (req, res) => {
            updated_at = CURRENT_TIMESTAMP
        WHERE ride_id = $4
        RETURNING *`,
-      [actualFare, completionTime || new Date(), tripDurationMinutes, rideId]
+      [actualFare, completionMoment, tripDurationMinutes, rideId]
     );
 
     // Add completion status log
@@ -641,10 +1019,10 @@ router.post('/:rideId/complete', authMiddleware, async (req, res) => {
         [passenger.partner_id]
       );
 
-      // Create completion notification for passenger with action and ride info
+      // Create completion notification for passenger
       await client.query(
         `INSERT INTO Notification (user_id, type, message, related_ride_id, related_user_id, is_read, action, ride_info)
-         VALUES ($1, 'ride_completed', $2, $3, $4, false, $5, $6)`,
+         VALUES ($1, 'ride_update', $2, $3, $4, false, $5, $6)`,
         [
           passenger.partner_id,
           'Your ride has been completed. Please rate your fellow passengers.',
