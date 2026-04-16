@@ -175,6 +175,17 @@ router.post('/', authMiddleware, async (req, res) => {
       return res.status(400).json({ error: 'No seats available' });
     }
 
+    // ENFORCE GENDER/VISIBILITY RESTRICTIONS
+    if (rideResult.gender_preference && rideResult.gender_preference.toLowerCase() === 'female') {
+      // Fetch user gender
+      const userResult = await client.query('SELECT gender FROM "User" WHERE user_id = $1', [req.userId]);
+      const userGender = userResult.rows[0]?.gender;
+      if (!userGender || userGender.toLowerCase() !== 'female') {
+        await client.query('ROLLBACK');
+        return res.status(403).json({ error: 'This ride is restricted to female participants only.' });
+      }
+    }
+
     // Create locations if provided
     let startLocationId = rideResult.start_location_id;
     let destLocationId = rideResult.dest_location_id;
@@ -212,6 +223,7 @@ router.post('/', authMiddleware, async (req, res) => {
       parsedRoutePolyline = rideResult.route_polyline;
     }
 
+
     // Insert join request
     const result = await client.query(
       `INSERT INTO Join_Request (ride_id, partner_id, start_location_id, dest_location_id, route_polyline, status) 
@@ -228,6 +240,19 @@ router.post('/', authMiddleware, async (req, res) => {
     );
 
     const joinRequest = result.rows[0];
+
+    // AUDIT LOG: join request submitted
+    await client.query(
+      `INSERT INTO Audit_Log (action, actor_user_id, target_request_id, target_ride_id, details)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [
+        'join_request_submitted',
+        req.userId,
+        joinRequest.request_id,
+        rideId,
+        JSON.stringify({ startLocationId, destLocationId })
+      ]
+    );
 
     // Add initial status
     await addRequestStatus(client, joinRequest.request_id, 'pending');
@@ -458,6 +483,19 @@ router.patch('/:requestId/accept', authMiddleware, async (req, res) => {
     // Update request status
     await addRequestStatus(client, req.params.requestId, 'accepted');
 
+    // AUDIT LOG: join request accepted
+    await client.query(
+      `INSERT INTO Audit_Log (action, actor_user_id, target_request_id, target_ride_id, details)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [
+        'join_request_accepted',
+        req.userId,
+        req.params.requestId,
+        request.ride_id,
+        JSON.stringify({ partner_id: request.partner_id })
+      ]
+    );
+
     // Update available seats
     await client.query(
       'UPDATE Ride SET available_seats = available_seats - 1 WHERE ride_id = $1',
@@ -553,6 +591,19 @@ router.patch('/:requestId/reject', authMiddleware, async (req, res) => {
     // Update status
     await addRequestStatus(client, req.params.requestId, 'rejected');
 
+    // AUDIT LOG: join request rejected
+    await client.query(
+      `INSERT INTO Audit_Log (action, actor_user_id, target_request_id, target_ride_id, details)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [
+        'join_request_rejected',
+        req.userId,
+        req.params.requestId,
+        rideId,
+        JSON.stringify({ partner_id: partnerId })
+      ]
+    );
+
     // Create notification
     await client.query(
       `INSERT INTO Notification (user_id, type, message, related_ride_id, related_user_id, related_request_id)
@@ -626,6 +677,19 @@ router.patch('/:requestId/cancel', authMiddleware, async (req, res) => {
 
     // Update status
     await addRequestStatus(client, req.params.requestId, 'cancelled');
+
+    // AUDIT LOG: join request cancelled
+    await client.query(
+      `INSERT INTO Audit_Log (action, actor_user_id, target_request_id, target_ride_id, details)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [
+        'join_request_cancelled',
+        req.userId,
+        req.params.requestId,
+        requestResult.rows[0].ride_id,
+        NULL
+      ]
+    );
 
     if (requestStatus === 'accepted') {
       await client.query(

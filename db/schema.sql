@@ -1,4 +1,19 @@
 -- =========================
+-- AUDIT LOG
+-- =========================
+CREATE TABLE IF NOT EXISTS Audit_Log (
+    audit_id SERIAL PRIMARY KEY,
+    action VARCHAR(50) NOT NULL,
+    actor_user_id INT,
+    target_request_id INT,
+    target_ride_id INT,
+    details JSONB,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_audit_actor FOREIGN KEY (actor_user_id) REFERENCES "User"(user_id) ON DELETE SET NULL,
+    CONSTRAINT fk_audit_request FOREIGN KEY (target_request_id) REFERENCES Join_Request(request_id) ON DELETE SET NULL,
+    CONSTRAINT fk_audit_ride FOREIGN KEY (target_ride_id) REFERENCES Ride(ride_id) ON DELETE SET NULL
+);
+-- =========================
 -- DROP EXISTING OBJECTS
 -- =========================
 DROP TABLE IF EXISTS Rating CASCADE;
