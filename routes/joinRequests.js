@@ -175,6 +175,17 @@ router.post('/', authMiddleware, async (req, res) => {
       return res.status(400).json({ error: 'No seats available' });
     }
 
+    // ENFORCE GENDER/VISIBILITY RESTRICTIONS
+    if (rideResult.gender_preference && rideResult.gender_preference.toLowerCase() === 'female') {
+      // Fetch user gender
+      const userResult = await client.query('SELECT gender FROM "User" WHERE user_id = $1', [req.userId]);
+      const userGender = userResult.rows[0]?.gender;
+      if (!userGender || userGender.toLowerCase() !== 'female') {
+        await client.query('ROLLBACK');
+        return res.status(403).json({ error: 'This ride is restricted to female participants only.' });
+      }
+    }
+
     // Create locations if provided
     let startLocationId = rideResult.start_location_id;
     let destLocationId = rideResult.dest_location_id;
@@ -212,6 +223,7 @@ router.post('/', authMiddleware, async (req, res) => {
       parsedRoutePolyline = rideResult.route_polyline;
     }
 
+
     // Insert join request
     const result = await client.query(
       `INSERT INTO Join_Request (ride_id, partner_id, start_location_id, dest_location_id, route_polyline, status) 
@@ -228,6 +240,19 @@ router.post('/', authMiddleware, async (req, res) => {
     );
 
     const joinRequest = result.rows[0];
+
+    // AUDIT LOG: join request submitted
+    await client.query(
+      `INSERT INTO Audit_Log (action, actor_user_id, target_request_id, target_ride_id, details)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [
+        'join_request_submitted',
+        req.userId,
+        joinRequest.request_id,
+        rideId,
+        JSON.stringify({ startLocationId, destLocationId })
+      ]
+    );
 
     // Add initial status
     await addRequestStatus(client, joinRequest.request_id, 'pending');
@@ -458,6 +483,19 @@ router.patch('/:requestId/accept', authMiddleware, async (req, res) => {
     // Update request status
     await addRequestStatus(client, req.params.requestId, 'accepted');
 
+    // AUDIT LOG: join request accepted
+    await client.query(
+      `INSERT INTO Audit_Log (action, actor_user_id, target_request_id, target_ride_id, details)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [
+        'join_request_accepted',
+        req.userId,
+        req.params.requestId,
+        request.ride_id,
+        JSON.stringify({ partner_id: request.partner_id })
+      ]
+    );
+
     // Update available seats
     await client.query(
       'UPDATE Ride SET available_seats = available_seats - 1 WHERE ride_id = $1',
@@ -485,23 +523,47 @@ router.patch('/:requestId/accept', authMiddleware, async (req, res) => {
     );
 
     // Add passenger to ride chat
-    const chatResult = await client.query(
+    let chatResult = await client.query(
       'SELECT chat_id FROM Chat WHERE ride_id = $1 AND type = \'ride\'',
       [request.ride_id]
     );
-    if (chatResult.rows.length > 0) {
-      const chatId = chatResult.rows[0].chat_id;
-      // Check if already in chat (though they shouldn't be)
-      const participantCheck = await client.query(
-        'SELECT * FROM Chat_Participants WHERE chat_id = $1 AND participant_id = $2',
+    let chatId;
+    
+    if (chatResult.rows.length === 0) {
+      // Create ride chat now since there are multiple participants (creator + this passenger)
+      const newChatRes = await client.query(
+        `INSERT INTO Chat (ride_id, type, created_by) VALUES ($1, 'ride', $2) RETURNING chat_id`,
+        [request.ride_id, request.creator_id]
+      );
+      chatId = newChatRes.rows[0].chat_id;
+      
+      // Add creator to chat
+      await client.query(
+        `INSERT INTO Chat_Participants (chat_id, participant_id, role) VALUES ($1, $2, 'creator')`,
+        [chatId, request.creator_id]
+      );
+    } else {
+      chatId = chatResult.rows[0].chat_id;
+    }
+
+    // Add passenger to ride chat
+    const participantCheck = await client.query(
+      'SELECT * FROM Chat_Participants WHERE chat_id = $1 AND participant_id = $2',
+      [chatId, request.partner_id]
+    );
+    if (participantCheck.rows.length === 0) {
+      await client.query(
+        `INSERT INTO Chat_Participants (chat_id, participant_id, role, status, joined_at) VALUES ($1, $2, 'requester', 'active', CURRENT_TIMESTAMP)`,
         [chatId, request.partner_id]
       );
-      if (participantCheck.rows.length === 0) {
-        await client.query(
-          'INSERT INTO Chat_Participants (chat_id, participant_id, role) VALUES ($1, $2, \'requester\')',
-          [chatId, request.partner_id]
-        );
-      }
+
+      // Insert system message for join event
+      const joinerNameRes = await client.query('SELECT name FROM "User" WHERE user_id = $1', [request.partner_id]);
+      const joinerName = joinerNameRes.rows[0]?.name || 'A user';
+      await client.query(
+        `INSERT INTO Message (chat_id, sender_id, content, type, system_flag, created_at) VALUES ($1, NULL, $2, 'system', true, CURRENT_TIMESTAMP)`,
+        [chatId, `${joinerName} joined the ride.`]
+      );
     }
 
     await client.query('COMMIT');
@@ -552,6 +614,19 @@ router.patch('/:requestId/reject', authMiddleware, async (req, res) => {
 
     // Update status
     await addRequestStatus(client, req.params.requestId, 'rejected');
+
+    // AUDIT LOG: join request rejected
+    await client.query(
+      `INSERT INTO Audit_Log (action, actor_user_id, target_request_id, target_ride_id, details)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [
+        'join_request_rejected',
+        req.userId,
+        req.params.requestId,
+        rideId,
+        JSON.stringify({ partner_id: partnerId })
+      ]
+    );
 
     // Create notification
     await client.query(
@@ -627,11 +702,45 @@ router.patch('/:requestId/cancel', authMiddleware, async (req, res) => {
     // Update status
     await addRequestStatus(client, req.params.requestId, 'cancelled');
 
+    // AUDIT LOG: join request cancelled
+    await client.query(
+      `INSERT INTO Audit_Log (action, actor_user_id, target_request_id, target_ride_id, details)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [
+        'join_request_cancelled',
+        req.userId,
+        req.params.requestId,
+        requestResult.rows[0].ride_id,
+        NULL
+      ]
+    );
+
     if (requestStatus === 'accepted') {
       await client.query(
         'UPDATE Ride SET available_seats = available_seats + 1 WHERE ride_id = $1',
         [requestResult.rows[0].ride_id]
       );
+    }
+
+    // Update chat participant status and removed_at if user was in chat
+    const chatRes = await client.query('SELECT chat_id FROM Chat WHERE ride_id = $1 AND type = \'ride\'', [requestResult.rows[0].ride_id]);
+    if (chatRes.rows.length > 0) {
+      const chatId = chatRes.rows[0].chat_id;
+      // Only update if participant exists and is active
+      const partRes = await client.query('SELECT * FROM Chat_Participants WHERE chat_id = $1 AND participant_id = $2 AND status = \'active\'', [chatId, req.userId]);
+      if (partRes.rows.length > 0) {
+        await client.query(
+          `UPDATE Chat_Participants SET status = 'left', removed_at = CURRENT_TIMESTAMP WHERE chat_id = $1 AND participant_id = $2`,
+          [chatId, req.userId]
+        );
+        // Insert system message for leave event
+        const leaverNameRes = await client.query('SELECT name FROM "User" WHERE user_id = $1', [req.userId]);
+        const leaverName = leaverNameRes.rows[0]?.name || 'A user';
+        await client.query(
+          `INSERT INTO Message (chat_id, sender_id, content, type, system_flag, created_at) VALUES ($1, NULL, $2, 'system', true, CURRENT_TIMESTAMP)`,
+          [chatId, `${leaverName} left the ride.`]
+        );
+      }
     }
 
     await client.query('COMMIT');

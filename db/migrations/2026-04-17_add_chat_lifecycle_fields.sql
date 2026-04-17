@@ -1,0 +1,11 @@
+-- Migration: Add lifecycle fields to Chat, Chat_Participants, and Message for ride group chat system
+
+ALTER TABLE Chat ADD COLUMN IF NOT EXISTS state VARCHAR(32) DEFAULT 'active';
+ALTER TABLE Chat ADD COLUMN IF NOT EXISTS closed_at TIMESTAMP;
+
+ALTER TABLE Chat_Participants ADD COLUMN IF NOT EXISTS status VARCHAR(32) DEFAULT 'active';
+ALTER TABLE Chat_Participants ADD COLUMN IF NOT EXISTS joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+ALTER TABLE Chat_Participants ADD COLUMN IF NOT EXISTS removed_at TIMESTAMP;
+
+ALTER TABLE Message ADD COLUMN IF NOT EXISTS type VARCHAR(32) DEFAULT 'text';
+ALTER TABLE Message ADD COLUMN IF NOT EXISTS system_flag BOOLEAN DEFAULT false;

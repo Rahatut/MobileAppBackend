@@ -55,6 +55,26 @@ router.get('/', authMiddleware, async (req, res) => {
   }
 });
 
+// Mark all notifications as read (must come before :notificationId/read route)
+router.patch('/mark-all/read', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `UPDATE Notification SET is_read = true, read_at = NOW() 
+       WHERE user_id = $1 AND is_read = false
+       RETURNING *`,
+      [req.userId]
+    );
+
+    res.json({ 
+      message: 'All notifications marked as read',
+      updatedCount: result.rowCount
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to mark all as read' });
+  }
+});
+
 // Mark notification as read
 router.patch('/:notificationId/read', authMiddleware, async (req, res) => {
   try {

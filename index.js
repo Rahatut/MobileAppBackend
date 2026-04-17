@@ -19,6 +19,7 @@ const ratingsRoutes = require('./routes/ratings');
 const notificationsRoutes = require('./routes/notifications');
 const chatRoutes = require('./routes/chat');
 const feedbackRoutes = require('./routes/feedback');
+const adminRoutes = require('./admin/adminRoutes');
 
 app.use('/api/auth', authRoutes);
 app.use('/api/users', usersRoutes);
@@ -30,6 +31,7 @@ app.use('/api/ratings', ratingsRoutes);
 app.use('/api/notifications', notificationsRoutes);
 app.use('/api/chats', chatRoutes);
 app.use('/api/feedback', feedbackRoutes);
+app.use('/api/admin', adminRoutes);
 
 // Health check
 app.get('/api/health', (req, res) => {

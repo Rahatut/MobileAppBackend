@@ -9,28 +9,41 @@ async function getChatMeta(client, chatId) {
   return result.rows[0] || null;
 }
 
-async function isRideGroupMember(client, rideId, userId) {
+async function getRideMemberStatus(client, rideId, userId) {
   const result = await client.query(
-    `SELECT 1
-     FROM Ride r
-     WHERE r.ride_id = $1
-       AND (
-         r.creator_id = $2
-         OR EXISTS (
-           SELECT 1
-           FROM Join_Request jr
-           WHERE jr.ride_id = r.ride_id
-             AND jr.partner_id = $2
-             AND COALESCE(
-               (SELECT status FROM Request_Status_Log WHERE request_id = jr.request_id ORDER BY timestamp DESC LIMIT 1),
-               jr.status
-             ) = 'accepted'
+    `SELECT
+       CASE 
+         WHEN r.creator_id = $2 THEN 'creator'
+         WHEN jr.request_id IS NOT NULL THEN COALESCE(
+           (SELECT status::text 
+            FROM Request_Status_Log 
+            WHERE request_id = jr.request_id 
+            ORDER BY timestamp DESC LIMIT 1),
+           jr.status::text
          )
-       )
-     LIMIT 1`,
+         ELSE NULL
+       END as membership_status,
+       CASE
+         WHEN jr.request_id IS NOT NULL THEN EXISTS (
+           SELECT 1 FROM Request_Status_Log 
+           WHERE request_id = jr.request_id AND status = 'accepted'
+         )
+         ELSE FALSE
+       END as was_ever_accepted
+     FROM Ride r
+     LEFT JOIN Join_Request jr ON jr.ride_id = r.ride_id AND jr.partner_id = $2
+     WHERE r.ride_id = $1`,
     [rideId, userId]
   );
-  return result.rows.length > 0;
+
+  if (result.rows.length === 0) return null;
+  const row = result.rows[0];
+
+  if (row.membership_status === 'creator') return 'creator';
+  if (row.membership_status === 'accepted') return 'active_passenger';
+  if (row.was_ever_accepted) return 'removed_passenger';
+
+  return null;
 }
 
 async function canUsersDirectMessage(client, userA, userB) {
@@ -90,11 +103,16 @@ async function isAuthorizedForChat(client, chatId, userId) {
 
   // For ride chats, enforce dynamic membership based on ride/join status.
   if (chat.type === 'ride' && chat.ride_id) {
-    const member = await isRideGroupMember(client, chat.ride_id, userId);
-    if (!member) {
+    const memberStatus = await getRideMemberStatus(client, chat.ride_id, userId);
+    if (!memberStatus) {
       return { ok: false, reason: 'Not authorized for this ride chat', status: 403 };
     }
-    return { ok: true, chat };
+    return {
+      ok: true,
+      chat,
+      memberStatus,
+      isActiveMember: memberStatus === 'creator' || memberStatus === 'active_passenger'
+    };
   }
 
   // For private chats, require Chat_Participants membership.
@@ -143,10 +161,11 @@ router.get('/', authMiddleware, async (req, res) => {
               FROM Join_Request jr
               WHERE jr.ride_id = c.ride_id
                 AND jr.partner_id = $1
-                AND COALESCE(
-                  (SELECT status FROM Request_Status_Log WHERE request_id = jr.request_id ORDER BY timestamp DESC LIMIT 1),
-                  jr.status
-                ) = 'accepted'
+                AND EXISTS (
+                  SELECT 1 FROM Request_Status_Log rsl 
+                  WHERE rsl.request_id = jr.request_id 
+                    AND rsl.status = 'accepted'
+                )
             )
          )
        ORDER BY last_message_time DESC
@@ -296,6 +315,22 @@ router.post('/:chatId/messages', authMiddleware, async (req, res) => {
       return res.status(authz.status).json({ error: authz.reason });
     }
 
+    if (authz.chat && authz.chat.type === 'ride') {
+      if (!authz.isActiveMember) {
+        return res.status(403).json({ error: 'You are no longer an active participant in this ride' });
+      }
+      
+      const rideStatusRes = await client.query(
+        `SELECT status FROM Ride_Status_Log WHERE ride_id = $1 ORDER BY timestamp DESC LIMIT 1`,
+        [authz.chat.ride_id]
+      );
+      const rideStatus = rideStatusRes.rows.length > 0 ? rideStatusRes.rows[0].status : 'unactive';
+      
+      if (rideStatus === 'completed' || rideStatus === 'cancelled') {
+        return res.status(403).json({ error: 'This chat is now read-only because the ride is completed or cancelled' });
+      }
+    }
+
     await client.query('BEGIN');
 
     const result = await client.query(
@@ -371,6 +406,27 @@ router.delete('/:chatId/messages/:messageId', authMiddleware, async (req, res) =
   try {
     const { chatId, messageId } = req.params;
 
+    const authz = await isAuthorizedForChat(pool, chatId, req.userId);
+    if (!authz.ok) {
+      return res.status(authz.status).json({ error: authz.reason });
+    }
+
+    if (authz.chat && authz.chat.type === 'ride') {
+      if (!authz.isActiveMember) {
+        return res.status(403).json({ error: 'You are no longer an active participant in this ride' });
+      }
+      
+      const rideStatusRes = await pool.query(
+        `SELECT status FROM Ride_Status_Log WHERE ride_id = $1 ORDER BY timestamp DESC LIMIT 1`,
+        [authz.chat.ride_id]
+      );
+      const rideStatus = rideStatusRes.rows.length > 0 ? rideStatusRes.rows[0].status : 'unactive';
+      
+      if (rideStatus === 'completed' || rideStatus === 'cancelled') {
+        return res.status(403).json({ error: 'This chat is now read-only because the ride is completed or cancelled' });
+      }
+    }
+
     // Verify message belongs to user
     const messageCheck = await pool.query(
       'SELECT sender_id FROM Message WHERE message_id = $1 AND chat_id = $2',
@@ -412,17 +468,30 @@ router.get('/:chatId', authMiddleware, async (req, res) => {
     if (chatResult.rows.length === 0) {
       return res.status(404).json({ error: 'Chat not found' });
     }
+    
+    const chat = chatResult.rows[0];
 
     const participantsResult = await pool.query(
-      `SELECT cp.*, u.name, u.username, u.avatar_url, u.phone
+      `SELECT cp.*, u.name, u.username, u.avatar_url, u.phone,
+              CASE 
+                WHEN cp.role = 'creator' THEN 'creator'
+                WHEN $2 = 'ride' THEN (
+                   SELECT rsl.status::text 
+                   FROM Join_Request jr 
+                   JOIN Request_Status_Log rsl ON jr.request_id = rsl.request_id
+                   WHERE jr.ride_id = $3 AND jr.partner_id = cp.participant_id
+                   ORDER BY rsl.timestamp DESC LIMIT 1
+                )
+                ELSE 'active'
+              END as ride_status
        FROM Chat_Participants cp
        JOIN "User" u ON cp.participant_id = u.user_id
        WHERE cp.chat_id = $1`,
-      [chatId]
+      [chatId, chat.type, chat.ride_id || null]
     );
 
     res.json({
-      chat: chatResult.rows[0],
+      chat: chat,
       participants: participantsResult.rows,
     });
   } catch (err) {
