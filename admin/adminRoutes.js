@@ -1,17 +1,23 @@
 const express = require('express');
 const pool = require('../db/pool');
-const authMiddleware = require('../middleware/auth');
-const adminPrivilege = require('../middleware/adminPrivilege');
+const adminAuth = require('../middleware/adminAuth');
 const { maskUser, maskRide } = require('../utils/maskSensitiveFields');
 const auditLogAction = require('../utils/auditLogAction');
 
 const router = express.Router();
 
-// Admin: Get all users (with admin privileges)
-
-router.get('/users', authMiddleware, adminPrivilege(), async (req, res) => {
+router.get('/users', adminAuth, async (req, res) => {
   try {
-    const result = await pool.query('SELECT * FROM "User"');
+    const result = await pool.query(`
+      SELECT u.user_id::text as id, u.name, u.username, a.email, u.phone, 
+             CASE WHEN u.is_active THEN 'active' ELSE 'suspended' END as status,
+             100 as "trustScore",
+             u.created_at as "joinedAt", u.updated_at as "lastActive",
+             u.total_rides as "ridesCount", u.avg_rating as rating,
+             0 as flags
+      FROM "User" u
+      LEFT JOIN auth a ON u.user_id = a.user_id
+    `);
     // Mask sensitive fields by default
     let users = result.rows.map(maskUser);
 
@@ -42,9 +48,25 @@ router.get('/users', authMiddleware, adminPrivilege(), async (req, res) => {
 
 // Admin: Get all rides
 
-router.get('/rides', authMiddleware, adminPrivilege(), async (req, res) => {
+router.get('/rides', adminAuth, async (req, res) => {
   try {
-    const result = await pool.query('SELECT * FROM Ride');
+    const result = await pool.query(`
+      SELECT r.ride_id::text as id, 
+             loc_start.name as from, loc_dest.name as to,
+             r.creator_id::text as "creatorId", u.name as "creatorName", u.phone as "creatorContact",
+             r.transport_mode as transport, r.start_time as "departureTime",
+             r.available_seats as seats,
+             (SELECT COUNT(*) FROM join_request WHERE ride_id = r.ride_id AND status = 'accepted') as "currentPassengers",
+             r.status,
+             (SELECT COUNT(*) FROM passenger_report WHERE ride_id = r.ride_id) as "reportCount",
+             '[]'::json as flags,
+             '[]'::json as "participantIds",
+             r.fare
+      FROM ride r
+      LEFT JOIN "User" u ON r.creator_id = u.user_id
+      LEFT JOIN location_info loc_start ON r.start_location_id = loc_start.location_id
+      LEFT JOIN location_info loc_dest ON r.dest_location_id = loc_dest.location_id
+    `);
     let rides = result.rows.map(maskRide);
 
     const { unmask, reason } = req.query;
@@ -73,16 +95,21 @@ router.get('/rides', authMiddleware, adminPrivilege(), async (req, res) => {
 
 // Admin: Get all join requests
 
-router.get('/join-requests', authMiddleware, adminPrivilege(), async (req, res) => {
+router.get('/join-requests', adminAuth, async (req, res) => {
   try {
     const result = await pool.query(`
-      SELECT jr.request_id, jr.ride_id, jr.partner_id, jr.start_location_id, jr.dest_location_id, jr.route_polyline, jr.timestamp,
-             u.name as partner_name, u.username as partner_username,
-             r.creator_id, r.start_time, r.transport_mode, r.fare, r.available_seats,
-             (SELECT status FROM Request_Status_Log WHERE request_id = jr.request_id ORDER BY timestamp DESC LIMIT 1) as status
-      FROM Join_Request jr
-      JOIN "User" u ON jr.partner_id = u.user_id
-      JOIN Ride r ON jr.ride_id = r.ride_id
+      SELECT jr.request_id::text as id, jr.partner_id::text as "requesterId", u.name as "requesterName",
+             jr.ride_id::text as "rideId", (COALESCE(loc_start.name, 'Origin') || ' -> ' || COALESCE(loc_dest.name, 'Dest')) as "rideName",
+             jr.status,
+             COALESCE((SELECT psl.status FROM payment p JOIN payment_status_log psl ON p.payment_id = psl.payment_id WHERE p.ride_id = jr.ride_id AND p.payer_id = jr.partner_id ORDER BY psl.timestamp DESC LIMIT 1), 'pending') as "paymentStatus",
+             jr.timestamp as "requestedAt",
+             false as "repairNeeded",
+             u.name as partner_name
+      FROM join_request jr
+      LEFT JOIN "User" u ON jr.partner_id = u.user_id
+      LEFT JOIN ride r ON jr.ride_id = r.ride_id
+      LEFT JOIN location_info loc_start ON r.start_location_id = loc_start.location_id
+      LEFT JOIN location_info loc_dest ON r.dest_location_id = loc_dest.location_id
       ORDER BY jr.timestamp DESC
     `);
     let joinRequests = result.rows;
@@ -116,7 +143,7 @@ router.get('/join-requests', authMiddleware, adminPrivilege(), async (req, res) 
 
 // Admin: Chat moderation (list all chats, delete message, ban user from chat, etc.)
 
-router.get('/chats', authMiddleware, adminPrivilege(), async (req, res) => {
+router.get('/chats', adminAuth, async (req, res) => {
   try {
     const result = await pool.query(`
       SELECT c.chat_id, c.type, c.created_at, c.ride_id, r.creator_id, r.start_time
@@ -153,7 +180,7 @@ router.get('/chats', authMiddleware, adminPrivilege(), async (req, res) => {
   }
 });
 
-router.delete('/chats/:chatId/messages/:messageId', authMiddleware, adminPrivilege(), async (req, res) => {
+router.delete('/chats/:chatId/messages/:messageId', adminAuth, async (req, res) => {
   const { chatId, messageId } = req.params;
   try {
     await pool.query('UPDATE Message SET is_deleted = true WHERE chat_id = $1 AND message_id = $2', [chatId, messageId]);
@@ -166,13 +193,14 @@ router.delete('/chats/:chatId/messages/:messageId', authMiddleware, adminPrivile
 
 // Admin: Safety/Incidents
 
-router.get('/incidents', authMiddleware, adminPrivilege(), async (req, res) => {
+router.get('/incidents', adminAuth, async (req, res) => {
   try {
     const result = await pool.query(`
-      SELECT pr.report_id, pr.ride_id, pr.request_id, pr.reporter_user_id, ru.name as reporter_name, ru.username as reporter_username,
-             pr.reported_user_id, rdu.name as reported_name, rdu.username as reported_username,
-             pr.reason, pr.details, pr.created_at
-      FROM Passenger_Report pr
+      SELECT pr.report_id::text as id, 'abuse_report' as type, 'medium' as severity, 'open' as status,
+             pr.ride_id::text as "rideId", pr.request_id, pr.reporter_user_id::text as "reporterId", ru.name as "reporterName", ru.username as reporter_username,
+             pr.reported_user_id::text as "targetId", rdu.name as "targetName", rdu.username as reported_username,
+             pr.reason, pr.details as description, pr.created_at as "reportedAt"
+      FROM passenger_report pr
       LEFT JOIN "User" ru ON pr.reporter_user_id = ru.user_id
       LEFT JOIN "User" rdu ON pr.reported_user_id = rdu.user_id
       ORDER BY pr.created_at DESC
@@ -207,7 +235,7 @@ router.get('/incidents', authMiddleware, adminPrivilege(), async (req, res) => {
   }
 });
 
-router.post('/incidents/:incidentId/resolve', authMiddleware, adminPrivilege(), async (req, res) => {
+router.post('/incidents/:incidentId/resolve', adminAuth, async (req, res) => {
   // For demo, just delete the report (in production, mark as resolved instead)
   const { incidentId } = req.params;
   try {
@@ -221,7 +249,7 @@ router.post('/incidents/:incidentId/resolve', authMiddleware, adminPrivilege(), 
 
 // Admin: Notifications management
 
-router.get('/notifications', authMiddleware, adminPrivilege(), async (req, res) => {
+router.get('/notifications', adminAuth, async (req, res) => {
   try {
     const result = await pool.query(`
       SELECT n.notification_id, n.user_id, u.name as user_name, u.username as user_username, n.type, n.message, n.is_read, n.created_at
@@ -259,7 +287,7 @@ router.get('/notifications', authMiddleware, adminPrivilege(), async (req, res) 
   }
 });
 
-router.post('/notifications/send', authMiddleware, adminPrivilege(), async (req, res) => {
+router.post('/notifications/send', adminAuth, async (req, res) => {
   const { user_id, type, message } = req.body;
   if (!user_id || !type || !message) {
     return res.status(400).json({ error: 'user_id, type, and message are required' });
@@ -279,82 +307,83 @@ router.post('/notifications/send', authMiddleware, adminPrivilege(), async (req,
 
 // Admin: Audit logs
 
-router.get('/audit-logs', authMiddleware, adminPrivilege(), async (req, res) => {
-  try {
-    const result = await pool.query(`
-      SELECT a.audit_id, a.action, a.actor_user_id, u.name as actor_name, u.username as actor_username,
-             a.target_request_id, a.target_ride_id, a.details, a.created_at
-      FROM Audit_Log a
-      LEFT JOIN "User" u ON a.actor_user_id = u.user_id
-      ORDER BY a.created_at DESC
-      LIMIT 200
-    `);
-    let logs = result.rows;
-    if (!(unmask === '1' && reason && req.admin)) {
-      logs = logs.map(l => ({
-        ...l,
-        action: l.action ? l.action[0] + '***' : '',
-        details: l.details ? l.details.slice(0, 10) + '...' : '',
-      }));
-    } else {
-      await auditLogAction({
-        adminId: req.admin.id,
-        action: 'audit_log_viewed',
-        targetType: 'audit_log',
-        targetId: 'ALL',
-        targetName: 'ALL',
-        reason: String(reason),
-        beforeState: 'masked',
-        afterState: 'unmasked',
-        sensitiveAccess: true,
-        ipAddress: req.ip,
-      });
-    }
-    res.json(logs);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Failed to fetch audit logs' });
-  }
+router.get('/audit-logs', adminAuth, async (req, res) => {
+  // No Audit_Log table; return empty array or optionally read from file
+  res.json([]);
 });
 
 // Admin: System repair
 
-router.get('/repair', authMiddleware, adminPrivilege(), async (req, res) => {
+router.get('/repair', adminAuth, async (req, res) => {
   // No repair table in schema, so return empty array for now
+  res.json([]);
+});
+
+router.post('/repair/:repairId/resolve', adminAuth, async (req, res) => {
+  // No repair table in schema, so just return success for now
+  res.json({ success: true });
+});
+
+// Admin: Metrics (Dynamic + System mock)
+router.get('/metrics/active-rides-chart', adminAuth, async (req, res) => {
   try {
-    const result = await pool.query('SELECT * FROM Repair_Request ORDER BY created_at DESC LIMIT 200');
-    let repairs = result.rows;
-    const { unmask, reason } = req.query;
-    if (!(unmask === '1' && reason && req.admin)) {
-      repairs = repairs.map(r => ({
-        ...r,
-        description: r.description ? r.description.slice(0, 10) + '...' : '',
-        contact: r.contact ? r.contact[0] + '***' : '',
-      }));
-    } else {
-      await auditLogAction({
-        adminId: req.admin.id,
-        action: 'repair_viewed',
-        targetType: 'repair',
-        targetId: 'ALL',
-        targetName: 'ALL',
-        reason: String(reason),
-        beforeState: 'masked',
-        afterState: 'unmasked',
-        sensitiveAccess: true,
-        ipAddress: req.ip,
-      });
+    const result = await pool.query(`
+      SELECT TO_CHAR(start_time, 'HH24:00') as hour, COUNT(*) as rides
+      FROM Ride
+      WHERE start_time >= NOW() - INTERVAL '24 HOURS'
+      GROUP BY TO_CHAR(start_time, 'HH24:00')
+      ORDER BY hour ASC
+    `);
+    let chartData = result.rows.map(r => ({ ...r, rides: parseInt(r.rides, 10) }));
+    if (chartData.length === 0) {
+      chartData = Array.from({length: 24}, (_, i) => ({ hour: `${i.toString().padStart(2, '0')}:00`, rides: 0 }));
     }
-    res.json(repairs);
+    res.json(chartData);
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'Failed to fetch repair requests' });
+    res.status(500).json({ error: 'Failed to fetch active rides chart' });
   }
 });
 
-router.post('/repair/:repairId/resolve', authMiddleware, adminPrivilege(), async (req, res) => {
-  // No repair table in schema, so just return success for now
-  res.json({ success: true });
+router.get('/metrics/report-types-chart', adminAuth, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT reason as name, COUNT(*) as value
+      FROM Passenger_Report
+      GROUP BY reason
+    `);
+    let data = result.rows.map(r => ({ name: r.name, value: parseInt(r.value, 10) }));
+    if (data.length === 0) data = [{ name: 'No Reports', value: 1 }];
+    res.json(data);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch report types chart' });
+  }
+});
+
+router.get('/metrics/active-users-chart', adminAuth, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT TO_CHAR(created_at, 'YYYY-MM-DD') as date, COUNT(*) as users
+      FROM "User"
+      WHERE created_at >= NOW() - INTERVAL '7 DAYS'
+      GROUP BY TO_CHAR(created_at, 'YYYY-MM-DD')
+      ORDER BY date ASC
+    `);
+    res.json(result.rows.map(r => ({ ...r, users: parseInt(r.users, 10) })));
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch active users chart' });
+  }
+});
+
+router.get('/metrics/system', adminAuth, async (req, res) => {
+  res.json([
+    { label: 'Cloud DB Storage', value: 42, unit: '%', status: 'good', trend: 'up' },
+    { label: 'Server Memory (RAM)', value: 78, unit: '%', status: 'warning', trend: 'up' },
+    { label: 'CPU Usage', value: 34, unit: '%', status: 'good', trend: 'down' },
+    { label: 'API Error Rate (5xx)', value: 0.2, unit: '%', status: 'good', trend: 'down' }
+  ]);
 });
 
 module.exports = router;

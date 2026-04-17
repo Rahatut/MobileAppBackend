@@ -1,6 +1,7 @@
 // auditLogAction.js
-// Utility to log admin actions with reason, before/after state, and sensitive access flag
-const pool = require('../db/pool');
+// Utility to log admin actions to standard output to respect db schema
+const fs = require('fs');
+const path = require('path');
 
 async function auditLogAction({
   adminId,
@@ -14,11 +15,13 @@ async function auditLogAction({
   sensitiveAccess = false,
   ipAddress,
 }) {
-  await pool.query(
-    `INSERT INTO Audit_Log (action, actor_user_id, target_type, target_id, target_name, reason, before_state, after_state, sensitive_access, ip_address, created_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW())`,
-    [action, adminId, targetType, targetId, targetName, reason, beforeState, afterState, sensitiveAccess, ipAddress]
-  );
+  const logMessage = `[${new Date().toISOString()}] AUDIT - Admin: ${adminId} | Action: ${action} | Target: ${targetType}(${targetId} - ${targetName}) | Reason: ${reason} | Sensitive: ${sensitiveAccess}\n`;
+  console.log(logMessage.trim());
+  try {
+    fs.appendFileSync(path.join(__dirname, '../admin_audit.log'), logMessage);
+  } catch(e) {
+    console.error("Failed to write to audit log file", e);
+  }
 }
 
 module.exports = auditLogAction;
