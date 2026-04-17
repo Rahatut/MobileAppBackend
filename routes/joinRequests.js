@@ -523,23 +523,47 @@ router.patch('/:requestId/accept', authMiddleware, async (req, res) => {
     );
 
     // Add passenger to ride chat
-    const chatResult = await client.query(
+    let chatResult = await client.query(
       'SELECT chat_id FROM Chat WHERE ride_id = $1 AND type = \'ride\'',
       [request.ride_id]
     );
-    if (chatResult.rows.length > 0) {
-      const chatId = chatResult.rows[0].chat_id;
-      // Check if already in chat (though they shouldn't be)
-      const participantCheck = await client.query(
-        'SELECT * FROM Chat_Participants WHERE chat_id = $1 AND participant_id = $2',
+    let chatId;
+    
+    if (chatResult.rows.length === 0) {
+      // Create ride chat now since there are multiple participants (creator + this passenger)
+      const newChatRes = await client.query(
+        `INSERT INTO Chat (ride_id, type, created_by) VALUES ($1, 'ride', $2) RETURNING chat_id`,
+        [request.ride_id, request.creator_id]
+      );
+      chatId = newChatRes.rows[0].chat_id;
+      
+      // Add creator to chat
+      await client.query(
+        `INSERT INTO Chat_Participants (chat_id, participant_id, role) VALUES ($1, $2, 'creator')`,
+        [chatId, request.creator_id]
+      );
+    } else {
+      chatId = chatResult.rows[0].chat_id;
+    }
+
+    // Add passenger to ride chat
+    const participantCheck = await client.query(
+      'SELECT * FROM Chat_Participants WHERE chat_id = $1 AND participant_id = $2',
+      [chatId, request.partner_id]
+    );
+    if (participantCheck.rows.length === 0) {
+      await client.query(
+        `INSERT INTO Chat_Participants (chat_id, participant_id, role, status, joined_at) VALUES ($1, $2, 'requester', 'active', CURRENT_TIMESTAMP)`,
         [chatId, request.partner_id]
       );
-      if (participantCheck.rows.length === 0) {
-        await client.query(
-          'INSERT INTO Chat_Participants (chat_id, participant_id, role) VALUES ($1, $2, \'requester\')',
-          [chatId, request.partner_id]
-        );
-      }
+
+      // Insert system message for join event
+      const joinerNameRes = await client.query('SELECT name FROM "User" WHERE user_id = $1', [request.partner_id]);
+      const joinerName = joinerNameRes.rows[0]?.name || 'A user';
+      await client.query(
+        `INSERT INTO Message (chat_id, sender_id, content, type, system_flag, created_at) VALUES ($1, NULL, $2, 'system', true, CURRENT_TIMESTAMP)`,
+        [chatId, `${joinerName} joined the ride.`]
+      );
     }
 
     await client.query('COMMIT');
@@ -696,6 +720,27 @@ router.patch('/:requestId/cancel', authMiddleware, async (req, res) => {
         'UPDATE Ride SET available_seats = available_seats + 1 WHERE ride_id = $1',
         [requestResult.rows[0].ride_id]
       );
+    }
+
+    // Update chat participant status and removed_at if user was in chat
+    const chatRes = await client.query('SELECT chat_id FROM Chat WHERE ride_id = $1 AND type = \'ride\'', [requestResult.rows[0].ride_id]);
+    if (chatRes.rows.length > 0) {
+      const chatId = chatRes.rows[0].chat_id;
+      // Only update if participant exists and is active
+      const partRes = await client.query('SELECT * FROM Chat_Participants WHERE chat_id = $1 AND participant_id = $2 AND status = \'active\'', [chatId, req.userId]);
+      if (partRes.rows.length > 0) {
+        await client.query(
+          `UPDATE Chat_Participants SET status = 'left', removed_at = CURRENT_TIMESTAMP WHERE chat_id = $1 AND participant_id = $2`,
+          [chatId, req.userId]
+        );
+        // Insert system message for leave event
+        const leaverNameRes = await client.query('SELECT name FROM "User" WHERE user_id = $1', [req.userId]);
+        const leaverName = leaverNameRes.rows[0]?.name || 'A user';
+        await client.query(
+          `INSERT INTO Message (chat_id, sender_id, content, type, system_flag, created_at) VALUES ($1, NULL, $2, 'system', true, CURRENT_TIMESTAMP)`,
+          [chatId, `${leaverName} left the ride.`]
+        );
+      }
     }
 
     await client.query('COMMIT');

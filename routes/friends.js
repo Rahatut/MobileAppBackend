@@ -168,7 +168,7 @@ router.patch('/request/:requestId/accept', authMiddleware, async (req, res) => {
     const receiverName = receiverResult.rows[0]?.name || 'Someone';
     await client.query(
       `INSERT INTO Notification (user_id, type, message, related_user_id) VALUES ($1, $2, $3, $4)`,
-      [request.sender_id, 'friend_request', `${receiverName} accepted your friend request.`, req.userId]
+      [request.sender_id, 'friend_request_accepted', `${receiverName} accepted your friend request.`, req.userId]
     );
 
     await client.query('COMMIT');

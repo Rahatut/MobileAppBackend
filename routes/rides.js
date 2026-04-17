@@ -133,6 +133,23 @@ router.delete('/:rideId/passenger/:passengerId', authMiddleware, async (req, res
       reportId = reportInsert.rows[0]?.report_id || null;
     }
 
+    // Update chat participant status and removed_at
+    const chatRes = await client.query('SELECT chat_id FROM Chat WHERE ride_id = $1 AND type = \'ride\'', [rideId]);
+    if (chatRes.rows.length > 0) {
+      const chatId = chatRes.rows[0].chat_id;
+      await client.query(
+        `UPDATE Chat_Participants SET status = 'removed', removed_at = CURRENT_TIMESTAMP WHERE chat_id = $1 AND participant_id = $2`,
+        [chatId, passengerId]
+      );
+      // Insert system message for removal
+      const removedNameRes = await client.query('SELECT name FROM "User" WHERE user_id = $1', [passengerId]);
+      const removedName = removedNameRes.rows[0]?.name || 'A user';
+      await client.query(
+        `INSERT INTO Message (chat_id, sender_id, content, type, system_flag, created_at) VALUES ($1, NULL, $2, 'system', true, CURRENT_TIMESTAMP)`,
+        [chatId, `${removedName} was removed from the ride.`]
+      );
+    }
+
     await client.query('COMMIT');
 
     // Notify the removed passenger
@@ -352,6 +369,7 @@ router.post('/', authMiddleware, async (req, res) => {
       endLocation.longitude !== undefined ? endLocation.longitude : endLocation.lng
     );
 
+
     // Create ride
     const rideResult = await client.query(
       `INSERT INTO Ride (creator_id, start_location_id, dest_location_id, start_time, 
@@ -374,8 +392,6 @@ router.post('/', authMiddleware, async (req, res) => {
         (() => {
           if (!routePolyline) return null;
           let parsed = typeof routePolyline === 'string' ? JSON.parse(routePolyline) : routePolyline;
-          
-          // Enforce GeoJSON LineString format exactly as converted by convert-polylines.js
           if (parsed && parsed.coordinates) {
              return JSON.stringify({
                type: 'LineString',
@@ -392,18 +408,19 @@ router.post('/', authMiddleware, async (req, res) => {
     // Add initial status
     await addRideStatus(client, ride.ride_id, 'unactive');
 
-    // Create ride chat
+    // Create group chat for this ride (state = 'active')
     const chatResult = await client.query(
-      `INSERT INTO Chat (ride_id, type, created_by) VALUES ($1, 'ride', $2) RETURNING chat_id`,
-      [ride.ride_id, req.userId]
+      `INSERT INTO Chat (ride_id, type, state) VALUES ($1, 'ride', 'active') RETURNING chat_id`,
+      [ride.ride_id]
     );
-    const chat = chatResult.rows[0];
+    const chatId = chatResult.rows[0].chat_id;
 
-    // Add creator to chat
+    // Add creator as first chat participant
     await client.query(
-      `INSERT INTO Chat_Participants (chat_id, participant_id, role) VALUES ($1, $2, 'creator')`,
-      [chat.chat_id, req.userId]
+      `INSERT INTO Chat_Participants (chat_id, participant_id, role, status, joined_at) VALUES ($1, $2, 'creator', 'active', CURRENT_TIMESTAMP)`,
+      [chatId, req.userId]
     );
+
 
     const fullRideResult = await client.query(
       `SELECT r.*, 
@@ -832,6 +849,20 @@ router.patch('/:rideId/status', authMiddleware, async (req, res) => {
       } else {
         await addRideStatus(client, rideId, status);
         finalStatus = status;
+
+        // Set chat state to 'read_only' and insert system message on cancellation
+        const chatRes = await client.query('SELECT chat_id FROM Chat WHERE ride_id = $1 AND type = \'ride\'', [rideId]);
+        if (chatRes.rows.length > 0) {
+          const chatId = chatRes.rows[0].chat_id;
+          await client.query(
+            `UPDATE Chat SET state = 'read_only', closed_at = CURRENT_TIMESTAMP WHERE chat_id = $1`,
+            [chatId]
+          );
+          await client.query(
+            `INSERT INTO Message (chat_id, sender_id, content, type, system_flag, created_at) VALUES ($1, NULL, $2, 'system', true, CURRENT_TIMESTAMP)`,
+            [chatId, 'Ride cancelled. Chat is now read-only.']
+          );
+        }
       }
     } else {
       await addRideStatus(client, rideId, status);
@@ -1047,6 +1078,20 @@ router.post('/:rideId/complete', authMiddleware, async (req, res) => {
         `INSERT INTO Notification (user_id, type, message, related_ride_id, is_read)
          VALUES ($1, 'ride_completed', 'Your ride has been completed with ' || $2 || ' passenger(s)', $3, false)`,
         [req.userId, passengersResult.rows.length, rideId]
+      );
+    }
+
+    // Set chat state to 'read_only' and insert system message
+    const chatRes = await client.query('SELECT chat_id FROM Chat WHERE ride_id = $1 AND type = \'ride\'', [rideId]);
+    if (chatRes.rows.length > 0) {
+      const chatId = chatRes.rows[0].chat_id;
+      await client.query(
+        `UPDATE Chat SET state = 'read_only', closed_at = CURRENT_TIMESTAMP WHERE chat_id = $1`,
+        [chatId]
+      );
+      await client.query(
+        `INSERT INTO Message (chat_id, sender_id, content, type, system_flag, created_at) VALUES ($1, NULL, $2, 'system', true, CURRENT_TIMESTAMP)`,
+        [chatId, 'Ride completed. Chat is now read-only.']
       );
     }
 

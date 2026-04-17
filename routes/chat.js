@@ -15,11 +15,11 @@ async function getRideMemberStatus(client, rideId, userId) {
        CASE 
          WHEN r.creator_id = $2 THEN 'creator'
          WHEN jr.request_id IS NOT NULL THEN COALESCE(
-           (SELECT status 
+           (SELECT status::text 
             FROM Request_Status_Log 
             WHERE request_id = jr.request_id 
             ORDER BY timestamp DESC LIMIT 1),
-           jr.status
+           jr.status::text
          )
          ELSE NULL
        END as membership_status,
@@ -476,7 +476,7 @@ router.get('/:chatId', authMiddleware, async (req, res) => {
               CASE 
                 WHEN cp.role = 'creator' THEN 'creator'
                 WHEN $2 = 'ride' THEN (
-                   SELECT rsl.status 
+                   SELECT rsl.status::text 
                    FROM Join_Request jr 
                    JOIN Request_Status_Log rsl ON jr.request_id = rsl.request_id
                    WHERE jr.ride_id = $3 AND jr.partner_id = cp.participant_id
