@@ -1,7 +1,7 @@
 -- =========================
 -- AUDIT LOG
 -- =========================
-CREATE TABLE IF NOT EXISTS Audit_Log (
+CREATE TABLE IF NOT EXISTS audit_log (
     audit_id SERIAL PRIMARY KEY,
     action VARCHAR(50) NOT NULL,
     actor_user_id INT,
@@ -119,7 +119,7 @@ CREATE TABLE Friend (
 -- =========================
 CREATE TABLE Friend_Request (
     request_id INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    sender_id INT NOT NULL,
+    sender_id INT,
     receiver_id INT NOT NULL,
     status_id INT,
     request_uuid UUID UNIQUE DEFAULT uuid_generate_v4(),
