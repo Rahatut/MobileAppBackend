@@ -1151,9 +1151,9 @@ router.post('/:rideId/complete', authMiddleware, async (req, res) => {
           JSON.stringify({
             rideId,
             fare: actualFare,
-            startTime: ride.start_time,
+            startTime: rideLifecycle.start_time_utc || rideLifecycle.start_time,
             completionTime: completionTime || new Date(),
-            creatorId: ride.creator_id,
+            creatorId: rideLifecycle.creator_id,
             // Add more ride info as needed
           })
         ]
