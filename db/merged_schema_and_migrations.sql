@@ -928,10 +928,16 @@ BEGIN
     WHERE
         -- Exclude user's own rides
         (p_user_id IS NULL OR r.creator_id != p_user_id)
-        
-        -- Filter by ride status
+
+        -- Filter by ride status (only show unactive rides)
         AND r.status = 'unactive'
-        
+
+        -- Exclude rides with no available seats
+        AND r.available_seats > 0
+
+        -- Exclude rides that have already started or passed
+        AND r.start_time > CURRENT_TIMESTAMP
+
         -- Location filtering
         AND (
             -- Case 1: No location filtering
