@@ -174,6 +174,7 @@ CREATE TABLE Ride (
     fare DECIMAL(10,2),
     available_seats INT,
 
+    CONSTRAINT check_available_seats_nonnegative CHECK (available_seats >= 0),
     CONSTRAINT fk_ride_creator FOREIGN KEY (creator_id) REFERENCES "User"(user_id) ON DELETE CASCADE,
     CONSTRAINT fk_ride_start FOREIGN KEY (start_location_id) REFERENCES Location_Info(location_id),
     CONSTRAINT fk_ride_dest FOREIGN KEY (dest_location_id) REFERENCES Location_Info(location_id)
