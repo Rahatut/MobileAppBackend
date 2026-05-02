@@ -434,11 +434,55 @@ router.post('/', authMiddleware, async (req, res) => {
       routePolyline,
     } = req.body;
 
-    if (!startLocation || !endLocation || !startTime || !transportMode || !availableSeats || fare === undefined) {
+    if (!startLocation || !endLocation || !startTime || !transportMode || availableSeats === undefined || fare === undefined) {
       return res.status(400).json({ error: 'Missing required fields' });
     }
 
+    // Server-side validation: transport-specific seat limits, gender preference, and schedule bounds
+    const TRANSPORT_MAX_SEATS = { Car: 3, CNG: 2, Bus: 40, Bike: 1 };
+
+    // Normalize transport mode (case-insensitive match to enum values)
+    const transportKey = Object.keys(TRANSPORT_MAX_SEATS).find(k => k.toLowerCase() === String(transportMode).toLowerCase());
+    if (!transportKey) {
+      return res.status(400).json({ error: 'Invalid transportMode' });
+    }
+    const normalizedTransportMode = transportKey; // matches DB enum casing
+
+    const seatsInt = parseInt(availableSeats, 10);
+    if (Number.isNaN(seatsInt) || seatsInt < 0 || seatsInt > TRANSPORT_MAX_SEATS[normalizedTransportMode]) {
+      return res.status(400).json({ error: `availableSeats must be between 0 and ${TRANSPORT_MAX_SEATS[normalizedTransportMode]} for ${normalizedTransportMode}` });
+    }
+    const normalizedAvailableSeats = seatsInt;
+
+    // Normalize gender preference: accept 'male','female','other' or 'any' (treat 'any' as null)
+    let normalizedGenderPreference = null;
+    if (genderPreference !== undefined && genderPreference !== null) {
+      const gp = String(genderPreference).toLowerCase();
+      if (!['male', 'female', 'other', 'any'].includes(gp)) {
+        return res.status(400).json({ error: "Invalid genderPreference, must be 'male', 'female', 'other', or 'any'" });
+      }
+      normalizedGenderPreference = gp === 'any' ? null : gp;
+    }
+
+    // Validate startTime
+    const parsedStart = toDateSafe(startTime);
+    if (!parsedStart) {
+      return res.status(400).json({ error: 'Invalid startTime' });
+    }
+    const minStart = new Date(Date.now() + 5 * 60 * 1000); // at least 5 minutes from now
+    const maxStart = new Date(Date.now() + 365 * 24 * 60 * 60 * 1000); // within 365 days
+    if (parsedStart < minStart || parsedStart > maxStart) {
+      return res.status(400).json({ error: 'startTime must be at least 5 minutes in the future and within 365 days' });
+    }
+
+    // Safe to begin DB work
     await client.query('BEGIN');
+
+    // Attach normalized values to variables we'll use for insertion
+    const _normalizedStartTime = parsedStart.toISOString();
+    const _normalizedTransportMode = normalizedTransportMode;
+    const _normalizedAvailableSeats = normalizedAvailableSeats;
+    const _normalizedGenderPreference = normalizedGenderPreference;
 
     // Create or get locations
     const startLocationId = await getOrCreateLocation(
@@ -469,13 +513,13 @@ router.post('/', authMiddleware, async (req, res) => {
         req.userId,
         startLocationId,
         destLocationId,
-        startTime,
-        transportMode,
+        _normalizedStartTime,
+        _normalizedTransportMode,
         transportDetail || null,
         rideProvider || 'Private',
-        availableSeats,
+        _normalizedAvailableSeats,
         fare,
-        genderPreference,
+        _normalizedGenderPreference,
         notes,
         (() => {
           if (!routePolyline) return null;
@@ -727,9 +771,9 @@ router.put('/:rideId', authMiddleware, async (req, res) => {
   try {
     await client.query('BEGIN');
 
-    // Verify ownership
+    // Verify ownership and fetch current ride info
     const rideResult = await client.query(
-      'SELECT creator_id FROM Ride WHERE ride_id = $1',
+      'SELECT creator_id, transport_mode, available_seats, start_time FROM Ride WHERE ride_id = $1',
       [rideId]
     );
 
@@ -741,6 +785,71 @@ router.put('/:rideId', authMiddleware, async (req, res) => {
     if (Number(rideResult.rows[0].creator_id) !== Number(req.userId)) {
       await client.query('ROLLBACK');
       return res.status(403).json({ error: 'Not authorized to edit this ride' });
+    }
+
+    // Additional server-side validation: ensure edits respect transport-specific limits, gender preference, and schedule rules
+    const TRANSPORT_MAX_SEATS = { Car: 3, CNG: 2, Bus: 40, Bike: 1 };
+    const currentRide = rideResult.rows[0];
+
+    // Get accepted passengers count
+    const acceptedCountRes = await client.query(
+      `SELECT COUNT(*)::int AS cnt FROM Join_Request jr
+       WHERE jr.ride_id = $1
+         AND (SELECT status FROM Request_Status_Log WHERE request_id = jr.request_id ORDER BY timestamp DESC LIMIT 1) = 'accepted'`,
+      [rideId]
+    );
+    const acceptedCount = acceptedCountRes.rows[0] ? parseInt(acceptedCountRes.rows[0].cnt, 10) : 0;
+
+    // Determine proposed new transport mode and seat count
+    const proposedTransportMode = transportMode || currentRide.transport_mode;
+    const transportKey = Object.keys(TRANSPORT_MAX_SEATS).find(k => k.toLowerCase() === String(proposedTransportMode).toLowerCase());
+    if (!transportKey) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Invalid transportMode' });
+    }
+    const _proposedTransportMode = transportKey;
+
+    const proposedSeats = availableSeats !== undefined && availableSeats !== null ? parseInt(availableSeats, 10) : currentRide.available_seats;
+    if (Number.isNaN(proposedSeats) || proposedSeats < 0 || proposedSeats > TRANSPORT_MAX_SEATS[_proposedTransportMode]) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: `availableSeats must be between 0 and ${TRANSPORT_MAX_SEATS[_proposedTransportMode]} for ${_proposedTransportMode}` });
+    }
+
+    // Cannot reduce seats below already accepted passengers
+    if (proposedSeats < acceptedCount) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: `Cannot set availableSeats to ${proposedSeats} because ${acceptedCount} passengers have already been accepted` });
+    }
+
+    // Validate genderPreference if provided
+    if (genderPreference !== undefined && genderPreference !== null) {
+      const gp = String(genderPreference).toLowerCase();
+      if (!['male', 'female', 'other', 'any'].includes(gp)) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: "Invalid genderPreference, must be 'male', 'female', 'other', or 'any'" });
+      }
+    }
+
+    // Validate startTime if provided
+    if (startTime) {
+      const parsedStart = toDateSafe(startTime);
+      if (!parsedStart) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'Invalid startTime' });
+      }
+      const minStart = new Date(Date.now() + 5 * 60 * 1000);
+      const maxStart = new Date(Date.now() + 365 * 24 * 60 * 60 * 1000);
+      if (parsedStart < minStart || parsedStart > maxStart) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'startTime must be at least 5 minutes in the future and within 365 days' });
+      }
+    }
+
+    // Disallow edits after ride has started
+    const rideLifecycle = await getRideLifecycle(client, rideId);
+    if (rideLifecycle && rideLifecycle.current_status !== 'unactive') {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Cannot edit ride after it has started' });
     }
 
     const updateResult = await client.query(
@@ -1151,9 +1260,9 @@ router.post('/:rideId/complete', authMiddleware, async (req, res) => {
           JSON.stringify({
             rideId,
             fare: actualFare,
-            startTime: ride.start_time,
+            startTime: rideLifecycle.start_time_utc || rideLifecycle.start_time,
             completionTime: completionTime || new Date(),
-            creatorId: ride.creator_id,
+            creatorId: rideLifecycle.creator_id,
             // Add more ride info as needed
           })
         ]

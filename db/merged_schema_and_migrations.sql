@@ -174,6 +174,7 @@ CREATE TABLE Ride (
     fare DECIMAL(10,2),
     available_seats INT,
 
+    CONSTRAINT check_available_seats_nonnegative CHECK (available_seats >= 0),
     CONSTRAINT fk_ride_creator FOREIGN KEY (creator_id) REFERENCES "User"(user_id) ON DELETE CASCADE,
     CONSTRAINT fk_ride_start FOREIGN KEY (start_location_id) REFERENCES Location_Info(location_id),
     CONSTRAINT fk_ride_dest FOREIGN KEY (dest_location_id) REFERENCES Location_Info(location_id)
@@ -928,10 +929,16 @@ BEGIN
     WHERE
         -- Exclude user's own rides
         (p_user_id IS NULL OR r.creator_id != p_user_id)
-        
-        -- Filter by ride status
+
+        -- Filter by ride status (only show unactive rides)
         AND r.status = 'unactive'
-        
+
+        -- Exclude rides with no available seats
+        AND r.available_seats > 0
+
+        -- Exclude rides that have already started or passed
+        AND r.start_time > CURRENT_TIMESTAMP
+
         -- Location filtering
         AND (
             -- Case 1: No location filtering
