@@ -201,6 +201,8 @@ CREATE TABLE Join_Request (
     request_uuid UUID UNIQUE DEFAULT uuid_generate_v4(),
     route_polyline TEXT,
     status request_status_enum DEFAULT 'pending',
+    payment_status payment_status_enum DEFAULT 'pending',
+    last_reminder_at TIMESTAMP,
     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 
     CONSTRAINT fk_jr_ride FOREIGN KEY (ride_id) REFERENCES Ride(ride_id) ON DELETE CASCADE,
@@ -236,6 +238,8 @@ CREATE TABLE Chat_Participants (
     chat_id INT NOT NULL,
     participant_id INT NOT NULL,
     role chat_role_enum,
+    status VARCHAR(20) DEFAULT 'active',
+    removed_at TIMESTAMP,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (chat_id, participant_id),
 

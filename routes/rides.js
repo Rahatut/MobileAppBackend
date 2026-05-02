@@ -173,6 +173,94 @@ router.delete('/:rideId/passenger/:passengerId', authMiddleware, async (req, res
   }
 });
 
+// Send a panic alert to other ride members (only during an ongoing ride)
+router.post('/:rideId/panic', authMiddleware, async (req, res) => {
+  const { rideId } = req.params;
+  const senderId = req.userId;
+  const client = await pool.connect();
+
+  try {
+    await client.query('BEGIN');
+
+    const rideLifecycle = await getRideLifecycle(client, rideId);
+    if (!rideLifecycle) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Ride not found' });
+    }
+
+    const currentStatus = rideLifecycle.current_status || 'unactive';
+    if (currentStatus !== 'started') {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Panic alerts are only available during an ongoing ride' });
+    }
+
+    const creatorId = Number(rideLifecycle.creator_id);
+    const isCreator = creatorId === Number(senderId);
+
+    let isAcceptedPassenger = false;
+    if (!isCreator) {
+      const membershipRes = await client.query(
+        `SELECT jr.request_id
+         FROM Join_Request jr
+         WHERE jr.ride_id = $1
+           AND jr.partner_id = $2
+           AND (SELECT status FROM Request_Status_Log WHERE request_id = jr.request_id ORDER BY timestamp DESC LIMIT 1) = 'accepted'
+         LIMIT 1`,
+        [rideId, senderId]
+      );
+      isAcceptedPassenger = membershipRes.rows.length > 0;
+    }
+
+    if (!isCreator && !isAcceptedPassenger) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ error: 'Not authorized to send a panic alert for this ride' });
+    }
+
+    const senderNameRes = await client.query('SELECT name FROM "User" WHERE user_id = $1', [senderId]);
+    const senderName = senderNameRes.rows[0]?.name || 'Someone';
+
+    const acceptedPassengersRes = await client.query(
+      `SELECT DISTINCT jr.partner_id
+       FROM Join_Request jr
+       WHERE jr.ride_id = $1
+         AND (SELECT status FROM Request_Status_Log WHERE request_id = jr.request_id ORDER BY timestamp DESC LIMIT 1) = 'accepted'`,
+      [rideId]
+    );
+
+    const recipients = new Set();
+    if (Number.isFinite(creatorId) && creatorId > 0) {
+      recipients.add(creatorId);
+    }
+    for (const row of acceptedPassengersRes.rows) {
+      const partnerId = Number(row.partner_id);
+      if (Number.isFinite(partnerId) && partnerId > 0) {
+        recipients.add(partnerId);
+      }
+    }
+    recipients.delete(Number(senderId));
+
+    const message = `${senderName} sent a panic alert for this ride.`;
+    let notifiedCount = 0;
+    for (const userId of recipients) {
+      await client.query(
+        `INSERT INTO Notification (user_id, type, message, related_ride_id, related_user_id, is_read)
+         VALUES ($1, 'panic_alert', $2, $3, $4, false)`,
+        [userId, message, rideId, senderId]
+      );
+      notifiedCount += 1;
+    }
+
+    await client.query('COMMIT');
+    return res.json({ message: 'Panic alert sent', notifiedCount });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error(err);
+    return res.status(500).json({ error: 'Failed to send panic alert' });
+  } finally {
+    client.release();
+  }
+});
+
 // ...existing code...
 
 // Request to join a ride with custom pickup/dropoff

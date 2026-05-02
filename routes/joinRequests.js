@@ -755,4 +755,106 @@ router.patch('/:requestId/cancel', authMiddleware, async (req, res) => {
   }
 });
 
+// Mark payment as completed (by passenger)
+router.patch('/:requestId/pay', authMiddleware, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await client.query(
+      'SELECT partner_id, ride_id FROM Join_Request WHERE request_id = $1',
+      [req.params.requestId]
+    );
+
+    if (result.rows.length === 0 || Number(result.rows[0].partner_id) !== Number(req.userId)) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
+
+    await client.query(
+      "UPDATE Join_Request SET payment_status = 'completed' WHERE request_id = $1",
+      [req.params.requestId]
+    );
+
+    // Notify Creator
+    const rideRes = await client.query('SELECT creator_id FROM Ride WHERE ride_id = $1', [result.rows[0].ride_id]);
+    const requesterNameRes = await client.query('SELECT name FROM "User" WHERE user_id = $1', [req.userId]);
+    
+    await client.query(
+      `INSERT INTO Notification (user_id, type, message, related_ride_id, related_user_id)
+       VALUES ($1, 'payment_received', $2, $3, $4)`,
+      [rideRes.rows[0].creator_id, `${requesterNameRes.rows[0].name} marked their fare as paid.`, result.rows[0].ride_id, req.userId]
+    );
+
+    await client.query('COMMIT');
+    res.json({ message: 'Payment status updated' });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: 'Failed to update payment status' });
+  } finally {
+    client.release();
+  }
+});
+
+// Send payment reminder (by creator)
+router.post('/:requestId/remind', authMiddleware, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { requestId } = req.params;
+    await client.query('BEGIN');
+
+    const info = await client.query(
+      `SELECT jr.partner_id, jr.ride_id, jr.last_reminder_at, jr.payment_status,
+              r.creator_id, r.status as ride_status, r.completion_time
+       FROM Join_Request jr
+       JOIN Ride r ON jr.ride_id = r.ride_id
+       WHERE jr.request_id = $1`,
+      [requestId]
+    );
+
+    if (info.rows.length === 0 || Number(info.rows[0].creator_id) !== Number(req.userId)) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
+
+    const request = info.rows[0];
+
+    if (request.payment_status === 'completed') {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Passenger has already paid' });
+    }
+
+    const now = new Date();
+    const oneDayInMs = 24 * 60 * 60 * 1000;
+
+    if (!request.completion_time || (now - new Date(request.completion_time)) < oneDayInMs) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Reminders can only be sent 1 day after ride completion' });
+    }
+
+    if (request.last_reminder_at && (now - new Date(request.last_reminder_at)) < oneDayInMs) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'You can only send one reminder per day' });
+    }
+
+    await client.query(
+      'UPDATE Join_Request SET last_reminder_at = CURRENT_TIMESTAMP WHERE request_id = $1',
+      [requestId]
+    );
+
+    await client.query(
+      `INSERT INTO Notification (user_id, type, message, related_ride_id, related_user_id)
+       VALUES ($1, 'payment_reminder', 'Reminder: Please complete your fare payment for the ride.', $2, $3)`,
+      [request.partner_id, request.ride_id, req.userId]
+    );
+
+    await client.query('COMMIT');
+    res.json({ message: 'Reminder sent' });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: 'Failed to send reminder' });
+  } finally {
+    client.release();
+  }
+});
+
 module.exports = router;
